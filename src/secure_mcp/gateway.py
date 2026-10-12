@@ -690,7 +690,7 @@ class GatewaySession:
             elif key in PROTOCOL or key == "cache_control":
                 result[key] = deepcopy(item)
             elif key == "arguments" and isinstance(item, str):
-                if restore and not item:
+                if not item.strip():
                     result[key] = ""
                     continue
                 result[key] = json.dumps(

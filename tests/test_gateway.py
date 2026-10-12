@@ -747,6 +747,18 @@ def test_custom_tool_name_and_schema_keys_are_consistent():
     assert json.loads(restored["arguments"]) == {"privateProperty": "public"}
 
 
+@pytest.mark.parametrize("arguments", ["", "   "])
+def test_empty_tool_arguments_survive_followup_request(arguments):
+    session = GatewaySession()
+    call = {"type": "function_call", "name": "get_time", "arguments": arguments}
+    payload = {"model": "fixture", "input": [call, {"role": "user", "content": "Next"}]}
+
+    masked = session.request(payload, dialect="responses")
+
+    assert masked["input"][0]["arguments"] == ""
+    assert session.walk(masked["input"][0], restore=True)["arguments"] == ""
+
+
 def test_public_exec_grammar_is_preserved_and_private_grammar_is_refused():
     from secure_mcp.gateway import EXEC_GRAMMAR
 
