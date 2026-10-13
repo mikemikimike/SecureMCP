@@ -314,7 +314,13 @@ class MaskingEngine:
         generator = getattr(reverse_store, "generator", None)
         guard = generator.operation() if generator else nullcontext()
         with guard:
-            sorted_values = sorted(reverse_store, key=len, reverse=True)
+            # Scan surrogate syntax in the input, then perform O(1) lookups.
+            # Only v1/nonstandard allocations need an inventory-based fallback.
+            legacy = getattr(reverse_store, "nonstandard_surrogates", None)
+            if legacy is None:
+                legacy = {value for value in reverse_store
+                          if not StrategyGenerator.get_pattern(strategy).fullmatch(value)}
+            sorted_values = sorted(legacy, key=len, reverse=True)
             alternatives = []
             for value in sorted_values:
                 escaped = re.escape(value)
@@ -334,7 +340,9 @@ class MaskingEngine:
                 run = match["numeric"]
                 if run is None:
                     key = match["alias"]
-                    mapping = reverse_store[key]
+                    mapping = reverse_store.get(key)
+                    if mapping is None:
+                        return match[0]
                     count += 1
                     unique.add(key)
                     suffix = match.groupdict().get("particle") or ""
@@ -357,10 +365,11 @@ class MaskingEngine:
             # Both forms are substituted from the original input in one pass:
             # restored originals may themselves contain allocated aliases.
             pattern = "(?P<numeric>" + NUMERIC_ALIAS_RUN.pattern + ")"
-            if alternatives:
-                pattern += "|(?P<alias>" + "|".join(alternatives) + ")"
-                if normalize_particles:
-                    pattern += r"(?P<particle>(?:으로|이랑|이나|은|는|을|를|과|와|이|가|로|랑|나)(?:부터|도|만|는|의)?(?=\s|[.,!?]|$))?"
+            syntax = StrategyGenerator.get_pattern(strategy).pattern.split(r"|\b", 1)[0]
+            aliases = [syntax, r"(?<![A-Za-z0-9_])(?:smcp_(?:ID|NUM|LIT)|private_symbol)_\d+(?![A-Za-z0-9_])"]
+            pattern += "|(?P<alias>" + "|".join(alternatives + aliases) + ")"
+            if normalize_particles:
+                pattern += r"(?P<particle>(?:으로|이랑|이나|은|는|을|를|과|와|이|가|로|랑|나)(?:부터|도|만|는|의)?(?=\s|[.,!?]|$))?"
             output = re.sub(pattern, restore, masked_text)
             candidates = StrategyGenerator.get_pattern(strategy).findall(masked_text)
             unmatched = sorted(

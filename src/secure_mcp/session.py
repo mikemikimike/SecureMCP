@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 from threading import TIMEOUT_MAX, Event, RLock, Thread
 import time
 import uuid
@@ -23,6 +24,88 @@ class SessionMappings(dict[str, TokenMapping]):
     def __init__(self, generator: StrategyGenerator):
         super().__init__()
         self.generator = generator
+        self._original_trie: dict | None = None
+        self.nonstandard_surrogates: set[str] = set()
+
+    def __setitem__(self, key, mapping):
+        if key in self:
+            self._original_trie = None
+            previous = self[key]
+            if isinstance(previous, TokenMapping):
+                self.nonstandard_surrogates.discard(previous.surrogate)
+        super().__setitem__(key, mapping)
+        if not isinstance(mapping, TokenMapping):
+            return
+        if not StrategyGenerator.get_pattern(self.generator.strategy).fullmatch(mapping.surrogate):
+            self.nonstandard_surrogates.add(mapping.surrogate)
+        if self._original_trie is not None:
+            self._index_original(mapping.original)
+
+    def _index_original(self, original):
+        node = self._original_trie
+        assert node is not None
+        for char in original:
+            node = node.setdefault(char, {})
+        node[None] = original
+
+    def originals_in(self, text: str) -> set[str]:
+        """Find only existing originals present in text, with an incremental trie."""
+        if self._original_trie is None:
+            self._original_trie = {}
+            for mapping in self.values():
+                if isinstance(mapping, TokenMapping):
+                    self._index_original(mapping.original)
+        found = set()
+        for match in re.finditer(r"(?<!\w)(?=\S)", text):
+            node = self._original_trie
+            for position in range(match.start(), len(text)):
+                child = node.get(text[position])
+                if child is None:
+                    break
+                node = child
+                if None in node:
+                    found.add(node[None])
+        return found
+
+    def __delitem__(self, key):
+        mapping = self[key]
+        super().__delitem__(key)
+        if isinstance(mapping, TokenMapping):
+            self.nonstandard_surrogates.discard(mapping.surrogate)
+        self._original_trie = None
+
+    def clear(self):
+        super().clear()
+        self.nonstandard_surrogates.clear()
+        self._original_trie = None
+
+    def update(self, *args, **kwargs):
+        for key, mapping in dict(*args, **kwargs).items():
+            self[key] = mapping
+
+    def pop(self, key, *default):
+        if key not in self:
+            return super().pop(key, *default)
+        mapping = self[key]
+        del self[key]
+        return mapping
+
+    def popitem(self):
+        key, mapping = super().popitem()
+        if isinstance(mapping, TokenMapping):
+            self.nonstandard_surrogates.discard(mapping.surrogate)
+        self._original_trie = None
+        return key, mapping
+
+    def setdefault(self, key, default=None):
+        if key not in self:
+            self[key] = default
+        return self[key]
+
+    # Unlike dict.__or__, in-place updates retain the TokenMapping value type.
+    def __ior__(self, other) -> SessionMappings:  # type: ignore[override, misc]
+        self.update(other)
+        return self
 
 
 class PrivacySession:

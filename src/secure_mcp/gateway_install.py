@@ -375,6 +375,7 @@ def _install_gateway(path: Path, agent, port, claude_dir, codex_dir, startup_pat
 def apply_settings(path: Path, config, changes):
     """Back up and transactionally apply settings, shared by subscription/API setup."""
     manifest_path = path.parent / "installation.json"
+    previous_config = path.read_bytes() if path.exists() else None
     previous_manifest = manifest_path.read_bytes() if manifest_path.exists() else None
     manifest = (
         _parse_installation_manifest(previous_manifest)
@@ -405,16 +406,16 @@ def apply_settings(path: Path, config, changes):
             }
             manifest["files"][name] = record
         record["installed_sha256"] = sha256(data).hexdigest()
-    _atomic_json(path, config)
-    path.chmod(0o600)
-    _atomic_json(manifest_path, manifest)
-    manifest_path.chmod(0o600)
     originals = {
         settings: settings.read_bytes() if settings.exists() else None
         for settings in changes
     }
     applied = []
     try:
+        _atomic_json(path, config)
+        path.chmod(0o600)
+        _atomic_json(manifest_path, manifest)
+        manifest_path.chmod(0o600)
         for settings, data in changes.items():
             atomic_bytes(settings, data)
             applied.append(settings)
@@ -427,9 +428,13 @@ def apply_settings(path: Path, config, changes):
             else:
                 atomic_bytes(settings, original)
         if previous_manifest is None:
-            manifest_path.unlink()
+            manifest_path.unlink(missing_ok=True)
         else:
             atomic_bytes(manifest_path, previous_manifest)
+        if previous_config is None:
+            path.unlink(missing_ok=True)
+        else:
+            atomic_bytes(path, previous_config)
         raise
     return list(changes)
 

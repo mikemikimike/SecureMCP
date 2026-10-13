@@ -6,6 +6,21 @@ SDK native tool 계약은 `google-antigravity==0.1.21`을 별도 환경에서 �
 
 ## CLI의 stdio MCP 연결
 
+자동 등록은 SecureMCP가 설치된 인터프리터를 그대로 사용한다:
+
+```powershell
+secure-mcp init --agent antigravity
+secure-mcp doctor --agent antigravity
+secure-mcp uninstall --agent antigravity
+```
+
+`--agent agy`도 같은 명령이다. 사용자 `~/.gemini/config/mcp_config.json`에
+등록하며 최초 설정의 `.secure-mcp.bak` 백업과 설치 소유권 기록을 남긴다.
+재설치는 원래 백업을 유지하고, 제거는 이전 `secure-mcp` 항목만 복원한다.
+다른 서버와 이후 사용자 설정 변경은 보존한다. 설치한 항목 자체를 편집한
+경우 재설치·제거를 거절하므로 먼저 해당 항목을 병합한다.
+이는 stdio MCP 등록이며 추론 요청 전체를 가리는 기능은 아니다.
+
 먼저 SecureMCP가 설치된 Python의 절대 경로를 확인한다. PowerShell 예:
 
 ```powershell
@@ -97,6 +112,10 @@ SDK는 optional dependency이므로 프로젝트의 기본 의존성을 바꾸�
 SDK 실행 환경에 `google-antigravity==0.1.21`을 별도로 설치한다.
 기존 SDK tool policy·작업 공간·local history 설정은 호출자가 유지한다.
 helper는 sandbox나 도구 권한을 승인하지 않는다.
+
+SDK endpoint는 게이트웨이가 허용하는 공개 쿼리(`api-version`, `client_version`,
+`beta`, 불리언 `stream`)를 검증 후 전달한다. 임의 쿼리는 원문 전송을 막기 위해 거절한다.
+스트리밍은 요청 JSON의 `stream` 필드로 지정한다.
 
 ### 인증·수명·지원 범위
 

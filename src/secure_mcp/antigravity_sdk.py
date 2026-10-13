@@ -13,7 +13,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from secure_mcp.gateway import LIMIT, NoRedirect
+from secure_mcp.gateway import LIMIT, NoRedirect, supported_query
 
 
 @contextmanager
@@ -80,14 +80,16 @@ def antigravity_endpoint(gateway_origin: str, local_token: str, api_key: str):
 
         def handle_request(self):
             # Authenticate before reading payloads. Never reflect capability URLs.
-            parts = self.path.split("/")
+            request_path, _, query = self.path.partition("?")
+            parts = request_path.split("/")
             supplied = parts[1] if len(parts) > 1 else ""
             if not secrets.compare_digest(supplied.encode(), capability.encode()):
                 self.error(401)
                 return
             if (
                 self.command != "POST"
-                or self.path != f"/{capability}/v1/chat/completions"
+                or request_path != f"/{capability}/v1/chat/completions"
+                or not supported_query(query)
             ):
                 self.error(400)
                 return
@@ -110,7 +112,7 @@ def antigravity_endpoint(gateway_origin: str, local_token: str, api_key: str):
                     self.error(400)
                     return
                 request = urllib.request.Request(
-                    endpoint,
+                    endpoint + ("?" + query if query else ""),
                     body,
                     {
                         "Content-Type": "application/json",

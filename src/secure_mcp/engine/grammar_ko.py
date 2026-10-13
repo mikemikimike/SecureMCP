@@ -399,6 +399,10 @@ def normalize_particle(original: str, particle: str) -> str:
     if not original or not is_hangul_char(original[-1]):
         return particle
     batchim = has_batchim(original[-1])
+    # Copular endings are not subject-marker 이/가 allomorphs. Retain the
+    # written form rather than guessing contraction of an arbitrary ending.
+    if particle.startswith(("이라", "이지만", "이다", "이야", "이란", "이며", "이고", "이니")):
+        return particle
     for consonant, vowel in [
         ("으로", "로"),
         ("이랑", "랑"),
@@ -410,6 +414,10 @@ def normalize_particle(original: str, particle: str) -> str:
     ]:
         for variant in (consonant, vowel):
             if particle.startswith(variant):
+                if consonant == "이" and particle[len(variant):] not in {
+                    "", "도", "만", "는", "부터", "의",
+                }:
+                    continue
                 use_consonant = batchim
                 if consonant == "으로" and (ord(original[-1]) - 0xAC00) % 28 == 8:
                     use_consonant = False

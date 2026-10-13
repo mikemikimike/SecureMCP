@@ -11,6 +11,7 @@ import sys
 import time
 
 import click
+from secure_mcp import __version__
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
@@ -96,7 +97,7 @@ def _session(sid, path, password, mode=None, strategy=None):
 
 
 @click.group(cls=LiteralArgumentGroup)
-@click.version_option(version="0.5.1")
+@click.version_option(version=__version__)
 def main():
     """SecureMCP: local English/Korean masking. Mask BEFORE sending data to a provider."""
 
@@ -113,7 +114,7 @@ def serve(transport):
 
 def _hook_options(command):
     command = click.option(
-        "--agent", type=click.Choice(["claude", "codex"]), default="claude"
+        "--agent", type=click.Choice(["claude", "codex", "antigravity", "agy"]), default="claude"
     )(command)
     command = click.option("--global", "global_scope", is_flag=True)(command)
     return click.option(
@@ -122,6 +123,8 @@ def _hook_options(command):
 
 
 def _hook_settings(global_scope, agent="claude"):
+    if agent in {"antigravity", "agy"}:
+        return Path.home() / ".gemini" / "config" / "mcp_config.json"
     if agent == "codex":
         home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
         return (home if global_scope else Path.cwd() / ".codex") / "hooks.json"
@@ -137,6 +140,15 @@ def _hook_settings(global_scope, agent="claude"):
 def init_hooks(agent, global_scope, state_dir):
     """Install local agent tool hooks. Prompts/attachments are not intercepted."""
     try:
+        if agent in {"antigravity", "agy"}:
+            from secure_mcp.antigravity_install import configure_antigravity
+
+            backup = configure_antigravity(_hook_settings(global_scope, agent))
+            click.echo("Antigravity stdio MCP registered. Restart agy; run secure-mcp doctor --agent antigravity.")
+            click.echo("Scope: MCP utilities only; prompts and inference are not intercepted.")
+            if backup:
+                click.echo(f"Settings backup: {backup}")
+            return
         backup = configure(
             _hook_settings(global_scope, agent),
             agent_state_dir(state_dir, agent),
@@ -164,6 +176,12 @@ def init_hooks(agent, global_scope, state_dir):
 def uninstall_hooks(agent, global_scope, state_dir):
     """Remove only SecureMCP hooks; preserve other settings and encrypted state."""
     try:
+        if agent in {"antigravity", "agy"}:
+            from secure_mcp.antigravity_install import configure_antigravity
+
+            configure_antigravity(_hook_settings(global_scope, agent), install=False)
+            click.echo("Antigravity SecureMCP registration restored. Restart agy.")
+            return
         configure(
             _hook_settings(global_scope, agent),
             agent_state_dir(state_dir, agent),
@@ -182,11 +200,16 @@ def uninstall_hooks(agent, global_scope, state_dir):
 def doctor(agent, global_scope, state_dir):
     """Inspect hook registration. Host-version compatibility needs a real smoke test."""
     try:
-        status = installation_status(
-            _hook_settings(global_scope, agent),
-            agent_state_dir(state_dir, agent),
-            agent,
-        )
+        if agent in {"antigravity", "agy"}:
+            from secure_mcp.antigravity_install import antigravity_status
+
+            status = antigravity_status(_hook_settings(global_scope, agent))
+        else:
+            status = installation_status(
+                _hook_settings(global_scope, agent),
+                agent_state_dir(state_dir, agent),
+                agent,
+            )
     except (ValueError, OSError) as exc:
         raise click.ClickException(str(exc)) from None
     click.echo(json.dumps(status, ensure_ascii=False))

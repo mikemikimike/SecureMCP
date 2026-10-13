@@ -4,6 +4,39 @@ import math
 import re
 
 
+def validate_cache_control(value):
+    if (
+        not isinstance(value, dict)
+        or set(value) - {"type", "ttl"}
+        or value.get("type") != "ephemeral"
+        or not isinstance(value.get("ttl", "5m"), str)
+        or value.get("ttl", "5m") not in {"5m", "1h"}
+    ):
+        raise ValueError("Unsupported cache control.")
+
+
+def _response_format(value):
+    if not isinstance(value, dict):
+        raise ValueError("Response format must be an object.")
+    kind = value.get("type")
+    if not isinstance(kind, str):
+        raise ValueError("Response format requires a public type.")
+    if kind in {"text", "json_object"} and set(value) == {"type"}:
+        return
+    if kind != "json_schema" or set(value) != {"type", "json_schema"}:
+        raise ValueError("Unsupported response format.")
+    schema = value["json_schema"]
+    if (
+        not isinstance(schema, dict)
+        or set(schema) - {"name", "description", "strict", "schema"}
+        or not isinstance(schema.get("name"), str)
+        or not isinstance(schema.get("schema"), dict)
+        or "description" in schema and not isinstance(schema["description"], str)
+        or "strict" in schema and not isinstance(schema["strict"], bool)
+    ):
+        raise ValueError("Invalid structured response schema.")
+
+
 def _enum(value, allowed, label):
     if not isinstance(value, str) or value not in allowed:
         raise ValueError(f"Unsupported {label}.")
@@ -131,6 +164,13 @@ def validate_request(payload, dialect):
         raise ValueError("Request must be an object.")
     if dialect not in {"claude", "codex", "responses", "chat_completions"}:
         raise ValueError("Unsupported request dialect.")
+    if "reasoning_effort" in payload or "response_format" in payload:
+        if dialect != "chat_completions":
+            raise ValueError("Chat Completions controls require that dialect.")
+        if "reasoning_effort" in payload:
+            _enum(payload["reasoning_effort"], {"none", "minimal", "low", "medium", "high", "xhigh"}, "reasoning effort")
+        if "response_format" in payload:
+            _response_format(payload["response_format"])
     if "model" in payload and (
         not isinstance(payload["model"], str)
         or not re.fullmatch(r"[A-Za-z0-9_./:-]{1,200}", payload["model"])

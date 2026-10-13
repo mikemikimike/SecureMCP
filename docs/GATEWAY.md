@@ -122,6 +122,28 @@ are treated as data: protocol-named keys such as `id`, `type` or `cache_control`
 them are still masked. Operational schema fields and JSON scalar numeric parameters retain
 their types; numbers in source text are masked.
 
+The local recursive root reference `$ref: "#"` is supported unchanged. Named anchor
+references (`#node`, `$anchor`) are not supported; use root or `#/...` pointers.
+Ordinary content/tool blocks validate `cache_control` as public `ephemeral` controls
+with optional `5m`/`1h` TTL; private extra fields are refused before forwarding.
+Protocol-named extra fields in tool output are masked rather than copied verbatim.
+Chat Completions supports validated `reasoning_effort` and `response_format` (`text`,
+`json_object`, or `json_schema`); schema names, descriptions and private properties
+still pass through masking. These controls are not accepted on Responses endpoints.
+
+Client sockets have a 60-second idle timeout, including incomplete headers/bodies.
+Upstream connection/read failures return sanitized 502 responses (504 for timeouts);
+invalid requests remain 400. Standard `anthropic-ratelimit-*` and `x-ratelimit-*`
+headers are forwarded along with retry guidance, without cookies or private headers.
+The public query allowlist also accepts boolean `stream=true`/`stream=false`;
+streaming behavior should still be specified in the provider's JSON request body.
+
+Restoration scans aliases in the response and looks them up directly. Prose masking
+uses an incremental index to select only existing originals present in the input,
+so stable requests do not recompile the entire mapping inventory. Legacy bare
+pseudoword snapshots retain a compatibility fallback. Mapping limits still bound
+memory use; they are not a guarantee of latency for arbitrarily large input.
+
 Signed Claude thinking (including `redacted_thinking`), and encrypted Codex reasoning remain
 exactly masked and are not restored for display. Only blocks previously emitted by this
 gateway can be replayed. Codex may omit an empty reasoning `content` list on replay; that
@@ -266,5 +288,6 @@ limits can reject large or slow streams; reset is not a substitute for context c
 
 
 POST query metadata is forwarded without alteration after validation: `beta=true|false`,
-`client_version` with dotted numeric components, and date-shaped `api-version` are supported.
+`stream=true|false`, `client_version` with dotted numeric components, and date-shaped
+`api-version` are supported.
 Unknown, duplicate, or private query parameters are rejected before contacting the provider.

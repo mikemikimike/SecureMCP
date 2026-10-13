@@ -15,6 +15,7 @@ import http.client
 from pathlib import Path
 import re
 import secrets
+import socket
 from threading import RLock
 from typing import Any
 import urllib.error
@@ -31,6 +32,8 @@ from secure_mcp.encrypted_session import (
 )
 from secure_mcp.hooks import _atomic_json
 from secure_mcp.gateway_validation import validate_request
+from secure_mcp.gateway_validation import validate_cache_control
+from secure_mcp.engine.grammar_en import CLOSED_CLASS_WORDS
 from secure_mcp.gateway_source import looks_like_source
 from secure_mcp.gateway_catalog import fetch_catalog
 from secure_mcp.models import MaskMode, SurrogateStrategy, TokenMapping, TokenType
@@ -312,6 +315,7 @@ def validate_api_options(payload, dialect):
         "stream_options",
         "metadata",
         "client_metadata",
+        "reasoning_effort",
         "prompt_cache_key",
         "safety_identifier",
     }
@@ -323,6 +327,7 @@ def validate_api_options(payload, dialect):
         "tool_choice",
         "text",
         "stop",
+        "response_format",
     }
     if set(payload) - controls - content:
         raise ValueError("Unsupported API controls.")
@@ -400,6 +405,8 @@ def validate_api_options(payload, dialect):
         "max_completion_tokens",
         "max_tokens",
         "stream_options",
+        "reasoning_effort",
+        "response_format",
     }:
         raise ValueError("Chat controls are unsupported in Responses.")
 
@@ -481,9 +488,12 @@ class GatewaySession:
 
     def _mask_prose(self, text: str, preserve_task_words: bool = True) -> str:
         s = self.session
-        # Force capitalized single-letter names such as A (an English article).
-        terms = {m.original for m in s.forward_store.values()}
-        terms.update(re.findall(r"\b[A-Z]\b", text))
+        # Existing source aliases take precedence over prose grammar (e.g. A).
+        terms = s.forward_store.originals_in(text)
+        terms.update(word for word in re.findall(r"\b[A-Z]\b", text)
+                     if not preserve_task_words or word.lower() not in CLOSED_CLASS_WORDS)
+        terms.update(re.findall(r"\b([A-Z])(?=\s+(?:함수|변수|식별자|클래스))", text))
+        terms.update(re.findall(r"\b(?:function|variable|identifier|class)\s+([A-Z])\b", text))
         return self.engine.mask_text(
             text,
             s.session_id,
@@ -687,8 +697,11 @@ class GatewaySession:
                 }
             ):
                 result[key] = item
-            elif key in PROTOCOL or key == "cache_control":
+            elif key == "cache_control":
+                validate_cache_control(item)
                 result[key] = deepcopy(item)
+            elif key in PROTOCOL:
+                result[key] = self.protocol_value(value, key, item, restore)
             elif key == "arguments" and isinstance(item, str):
                 if not item.strip():
                     result[key] = ""
@@ -706,9 +719,11 @@ class GatewaySession:
                 "function_call_output",
                 "custom_tool_call_output",
             }:
-                result[key] = self.walk(item, restore, code=True)
+                result[key] = self.tool_output(item, restore)
             elif key == "content" and kind == "tool_result":
-                result[key] = self.walk(item, restore, code=True)
+                result[key] = self.tool_output(item, restore)
+            elif key == "content" and value.get("role") == "tool":
+                result[key] = self.tool_output(item, restore)
             elif (key == "patternProperties" and item) or (
                 key == "pattern" and isinstance(item, str) and kind in SCHEMA_TYPES
             ):
@@ -748,6 +763,9 @@ class GatewaySession:
                     for k in item
                 ]
             elif key == "$ref" and isinstance(item, str):
+                if item == "#":
+                    result[key] = item
+                    continue
                 if not item.startswith("#/"):
                     raise ValueError("Remote schema references are unsupported.")
                 segments = item[2:].split("/")
@@ -777,8 +795,78 @@ class GatewaySession:
                 # values under keys like id/type/model/cache_control leak.
                 result[key] = self.walk_data(item, restore)
             else:
-                result[key] = self.walk(item, restore, code)
+                if (kind in {"text", "input_text", "output_text", "refusal"}
+                    or "role" in value) and key not in {"content", "tool_calls"}:
+                    result[key] = self.walk_data(item, restore)
+                else:
+                    result[key] = self.walk(item, restore, code)
         return result
+
+    def tool_output(self, value, restore=False):
+        """Content blocks have public envelopes; their extra payloads are data."""
+        if isinstance(value, str):
+            return self.restore(value) if restore else self.mask(value, code=True)
+        if not isinstance(value, list):
+            return self.walk_data(value, restore)
+        result = []
+        for block in value:
+            if isinstance(block, dict) and block.get("type") in {
+                "text", "input_text", "output_text", "refusal",
+            }:
+                public_fields = {"type", "text", "refusal", "cache_control"}
+                transformed = self.walk(
+                    {key: item for key, item in block.items() if key in public_fields},
+                    restore, code=True,
+                )
+                for key, item in block.items():
+                    if key not in public_fields:
+                        name = self.restore(key) if restore else self.mask(key, code=True)
+                        transformed[name] = self.walk_data(item, restore)
+                result.append(transformed)
+            else:
+                result.append(self.walk(block, restore, code=True))
+        return result
+
+    def protocol_value(self, envelope, key, item, restore):
+        """Public tags apply only to their envelopes, never arbitrary data."""
+        kind = envelope.get("type")
+        if not isinstance(kind, str):
+            kind = ""
+        kinds = {
+            "text", "input_text", "output_text", "refusal", "message",
+            "tool_use", "tool_result", "function_call", "function_call_output",
+            "custom_tool_call", "custom_tool_call_output", "tool_namespace",
+            "tool_reference", "function", "custom", "json_schema", "json_object",
+        } | SCHEMA_TYPES
+        if key == "type" and isinstance(item, list) and all(
+            isinstance(tag, str) and tag in SCHEMA_TYPES for tag in item
+        ):
+            return deepcopy(item)
+        keep = key == "type" and isinstance(item, str) and item in kinds
+        if key == "role":
+            keep = "content" in envelope and isinstance(item, str) and item in {
+                "system", "developer", "user", "assistant", "tool",
+            }
+        elif key == "id":
+            keep = kind in {"tool_use", "function_call", "custom_tool_call", "message"}
+        elif key == "call_id":
+            keep = kind in {"function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output"}
+        elif key == "tool_use_id":
+            keep = kind == "tool_result"
+        elif key == "tool_call_id":
+            keep = envelope.get("role") == "tool" and "content" in envelope
+        elif key in {"effort", "verbosity", "syntax"}:
+            allowed = {
+                "effort": {"none", "minimal", "low", "medium", "high", "xhigh", "max"},
+                "verbosity": {"low", "medium", "high"},
+                "syntax": {"lark", "regex"},
+            }
+            keep = isinstance(item, str) and item in allowed[key]
+        if keep:
+            if not isinstance(item, str):
+                raise ValueError("Protocol identifiers must be text.")
+            return item
+        return self.walk_data(item, restore)
 
     def schema_name(self, name, restore=False):
         if not isinstance(name, str):
@@ -872,7 +960,7 @@ class GatewaySession:
             payload, dialect or ("claude" if "messages" in payload else "codex")
         )
         fields = (
-            TOP_FIELDS | {"max_completion_tokens", "stop", "stream_options"}
+            TOP_FIELDS | {"max_completion_tokens", "stop", "stream_options", "reasoning_effort", "response_format"}
             if dialect == "chat_completions"
             else TOP_FIELDS
         )
@@ -953,6 +1041,7 @@ class GatewaySession:
                 "stop",
                 "tool_choice",
                 "output_config",
+                "response_format",
                 "context_management",
                 "safeguards",
             }:
@@ -1318,6 +1407,7 @@ class PrivacyGateway(ThreadingHTTPServer):
 class GatewayHandler(BaseHTTPRequestHandler):
     server: PrivacyGateway
     protocol_version = "HTTP/1.0"
+    timeout = 60
 
     def log_message(self, *_):
         pass  # Never log headers, prompts, replies or tokens.
@@ -1337,7 +1427,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             key: value
             for key, value in headers.items()
             if key.lower() in {"retry-after", "x-should-retry"}
-            or key.lower().startswith("anthropic-ratelimit-unified-")
+            or key.lower().startswith(("anthropic-ratelimit-", "x-ratelimit-"))
         }
 
     def authorized(self):
@@ -1550,9 +1640,24 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 opener = urllib.request.build_opener(
                     urllib.request.ProxyHandler({}), NoRedirect()
                 )
-                with opener.open(request, timeout=180) as upstream:
+                try:
+                    upstream_response = opener.open(request, timeout=180)
+                except urllib.error.HTTPError:
+                    raise
+                except (OSError, http.client.HTTPException) as exc:
+                    reason = getattr(exc, "reason", exc)
+                    status = 504 if isinstance(reason, (TimeoutError, socket.timeout)) else 502
+                    self.send_body(status, b'{"error":"Upstream transport unavailable"}')
+                    return
+                with upstream_response as upstream:
                     self.capture_response_headers(upstream.headers)
-                    body = upstream.read(LIMIT + 1)
+                    try:
+                        body = upstream.read(LIMIT + 1)
+                    except (OSError, http.client.HTTPException) as exc:
+                        reason = getattr(exc, "reason", exc)
+                        status = 504 if isinstance(reason, TimeoutError) else 502
+                        self.send_body(status, b'{"error":"Upstream transport unavailable"}')
+                        return
                     if len(body) > LIMIT:
                         raise ValueError("Response size limit exceeded.")
                     content_type = upstream.headers.get(
@@ -1599,7 +1704,7 @@ def supported_query(query):
     if len({key for key, _ in pairs}) != len(pairs):
         return False
     return all(
-        (key == "beta" and value in {"true", "false"})
+        (key in {"beta", "stream"} and value in {"true", "false"})
         or (key == "client_version" and re.fullmatch(r"[0-9]{1,4}(?:\.[0-9]{1,4}){0,3}", value))
         or (key == "api-version" and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value))
         for key, value in pairs
