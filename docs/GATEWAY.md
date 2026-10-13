@@ -5,6 +5,62 @@ Codex. Set it up once, then use their normal commands. Requests are masked autom
 replies and tool arguments are restored before the CLI displays or executes them. The next
 request masks restored history again. No agent hooks are registered.
 
+## Local administrator dashboard and SQLite logs
+
+The gateway serves a local dashboard at `http://127.0.0.1:38117/admin` (use your
+configured port). Open it with:
+
+```bash
+secure-mcp gateway admin
+# For a custom config, including the isolated xAI API gateway:
+secure-mcp gateway admin --config /path/to/config.json
+# Print the URL without launching a browser:
+secure-mcp gateway admin --no-open
+```
+
+Start or restart the updated gateway first. Sign in with the `token` in its local
+`config.json`. This uses the existing gateway capability; there is no separate
+admin password. The browser keeps the token only in tab memory, sends it in a
+header, and clears it on logout. Reloading the page requires signing in again.
+The dashboard loads no external scripts or fonts and provides read-only access.
+
+Foreground and automatically started gateways store processing metadata in
+`logs.sqlite3` beside their `config.json`. Subscription and xAI API installations
+use their respective configuration directories. SQLite uses WAL and preserves
+logs across restarts; only the newest 100,000 records are retained. Uninstalling
+or resetting alias sessions does not delete this ledger. Back up the database
+after stopping the gateway, or use SQLite's online backup API when it is running.
+
+The dashboard includes summary totals, provider/authentication routes, automatic
+refresh, agent/provider/subscription/result/account/time filters, pagination and
+request details. Each fixed inference or token-count endpoint records UTC time,
+request ID, agent, provider, authentication mode, model, destination, HTTP status,
+processing outcome, upstream connection attempt, duration, byte counts and new
+alias count. It excludes request/response bodies, query strings, error text,
+raw headers, OAuth tokens and API keys. Model names are bounded metadata.
+
+`Claude Code → Anthropic → Claude subscription`, `Codex → OpenAI → ChatGPT
+subscription`, and explicit `xAI → API key` paths are distinct. New Grok Build
+installations and the Antigravity SDK transport attach an allowlisted source
+label; other xAI clients are shown as `xAI client`. These labels describe the
+client's reported source, not an independently verified executable. CLI flags
+that bypass the gateway generate no gateway log.
+
+Codex's supplied account ID is stored as a keyed anonymous reference. A separate
+keyed credential reference identifies the presented token/key without storing it.
+Both references are specific to this gateway token; credential references change
+when OAuth tokens rotate. Claude does not supply an account ID, so its account is
+shown as unavailable. These references cannot verify a billing identity or the
+subscription tier (Plus/Pro/Max/etc.), and the dashboard does not invent one.
+
+Logging starts before request processing. If the initial SQLite write fails,
+the request is refused with HTTP 503 before forwarding. If completion logging
+fails, the initial record remains incomplete and the dashboard reports a write
+error count for the current daemon. An incomplete record can also represent an
+active request or interrupted process. An upstream attempt records a connection
+attempt, not proof that a provider received or billed a request. Administrative,
+health, model-catalog and unsupported endpoints do not enter the request ledger.
+
 ## Setup and existing logins
 
 Keep your existing Claude/ChatGPT subscription login:
@@ -32,6 +88,23 @@ Then restart both agents. These steps are needed only when updating the installe
 | --- | --- | --- |
 | Claude Code | `$CLAUDE_CONFIG_DIR/settings.json`, default `~/.claude/settings.json`: base URL and local custom header | Existing OAuth and `anthropic-beta`; no API key/helper added |
 | Codex | `$CODEX_HOME/config.toml`, default `~/.codex/config.toml`: provider with `requires_openai_auth = true`, HTTP transport, ChatGPT login selection | Existing CLI-owned ChatGPT OAuth and account header |
+
+When launched inside an Orca-managed Codex account, `CODEX_HOME` is a mirrored
+account directory. Orca synchronizes its config from the canonical `~/.codex/config.toml`;
+editing only the account copy is overwritten on synchronization. The installer detects
+matching `CODEX_HOME`/`ORCA_CODEX_HOME` and the `.orca-managed-home` marker, and backs up
+and configures both canonical and active account settings in the same transaction.
+The canonical configuration is user-wide and can propagate to other Orca accounts.
+Login files are not copied or edited. Restart existing agent sessions to load the new
+provider. This handles config mirroring; it does not certify every Orca runtime's routing
+or its command-line overrides. Verify a disposable inference request before relying on it.
+
+`gateway status` checks authenticated server health and, when an installation record
+exists, verifies installed settings against their recorded hashes. Missing/changed files
+produce a nonzero exit with a routing-unverified message; even unrelated edits require
+review. A healthy manually started server without a manifest reports that installation
+routing cannot be verified. Server health and settings checks are not proof that an
+already-running agent sent an inference request through this gateway.
 
 These settings follow [Claude's subscription gateway documentation](https://code.claude.com/docs/en/llm-gateway#subscriptions-and-gateways)
 and [Codex's proxy authentication option](https://learn.chatgpt.com/docs/auth#alternative-model-providers).

@@ -16,6 +16,8 @@ from pathlib import Path
 import re
 import secrets
 import socket
+import sqlite3
+import time
 from threading import RLock
 from typing import Any
 import urllib.error
@@ -36,6 +38,8 @@ from secure_mcp.gateway_validation import validate_cache_control
 from secure_mcp.engine.grammar_en import CLOSED_CLASS_WORDS
 from secure_mcp.gateway_source import looks_like_source
 from secure_mcp.gateway_catalog import fetch_catalog
+from secure_mcp.gateway_audit import AuditStore, anonymous_ref
+from secure_mcp.gateway_admin import handle_admin
 from secure_mcp.models import MaskMode, SurrogateStrategy, TokenMapping, TokenType
 from secure_mcp.session import PrivacySession
 
@@ -1271,6 +1275,7 @@ class PrivacyGateway(ThreadingHTTPServer):
         state_dir: Path | None = None,
         api_upstreams=None,
         mapping_limit=100_000,
+        audit_path: Path | None = None,
     ):
         if address[0] != "127.0.0.1":
             raise ValueError("Gateway must bind to IPv4 loopback.")
@@ -1302,6 +1307,8 @@ class PrivacyGateway(ThreadingHTTPServer):
         if state_dir:
             state_dir.mkdir(parents=True, exist_ok=True)
             state_dir.chmod(0o700)
+        self.audit = AuditStore(audit_path) if audit_path is not None else None
+        self.audit_write_errors = 0
         super().__init__(address, GatewayHandler)
 
     def get_session(self, agent):
@@ -1406,6 +1413,7 @@ class PrivacyGateway(ThreadingHTTPServer):
 
 class GatewayHandler(BaseHTTPRequestHandler):
     server: PrivacyGateway
+    audit_metadata: dict[str, Any] | None = None
     protocol_version = "HTTP/1.0"
     timeout = 60
 
@@ -1413,6 +1421,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
         pass  # Never log headers, prompts, replies or tokens.
 
     def send_body(self, status, body, content_type="application/json"):
+        if self.audit_metadata is not None:
+            self.audit_metadata["status"] = status
+            self.audit_metadata["output_bytes"] = len(body)
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
@@ -1432,10 +1443,12 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
     def authorized(self):
         return secrets.compare_digest(
-            self.headers.get("X-SecureMCP-Token", ""), self.server.token
+            self.headers.get("X-SecureMCP-Token", "").encode(), self.server.token.encode()
         )
 
     def do_GET(self):
+        if handle_admin(self):
+            return
         if self.path == "/xai/v1/models":
             if not self.authorized():
                 self.send_body(401, b'{"error":"Unauthorized"}')
@@ -1501,6 +1514,54 @@ class GatewayHandler(BaseHTTPRequestHandler):
             )
 
     def do_POST(self):
+        # Only fixed inference routes enter the ledger; never store caller paths,
+        # query strings, error bodies, arbitrary headers or request/response text.
+        request_path = self.path.partition("?")[0]
+        provider = (
+            "claude" if request_path in {"/claude/v1/messages", "/claude/v1/messages/count_tokens"}
+            else "codex" if request_path == "/codex/responses"
+            else "xai" if request_path in {"/xai/v1/responses", "/xai/v1/chat/completions"}
+            else None
+        )
+        self.audit_metadata = None
+        if provider is None or self.server.audit is None:
+            self._do_POST()
+            return
+        agent = {"claude": "Claude Code", "codex": "Codex", "xai": "xAI client"}[provider]
+        subscription = {"claude": "claude_subscription", "codex": "chatgpt_subscription",
+                        "xai": "api_key"}[provider]
+        origin = urllib.parse.urlsplit(self.server.upstreams.get(provider, ""))
+        destination = origin.scheme + "://" + origin.netloc.split("@")[-1] + origin.path
+        try:
+            request_id = self.server.audit.begin(
+                agent, provider, subscription, request_path, destination,
+            )
+        except sqlite3.Error:
+            self.server.audit_write_errors += 1
+            self.send_body(503, b'{"error":"Audit storage unavailable; no request forwarded"}')
+            return
+        self.audit_metadata = {
+            "agent": agent, "account_ref": None, "credential_ref": None,
+            "model": None, "status": None, "outcome": "blocked",
+            "upstream_attempted": 0, "input_bytes": 0, "masked_bytes": 0,
+            "output_bytes": 0, "new_aliases": 0,
+        }
+        started = time.perf_counter()
+        try:
+            self._do_POST()
+        finally:
+            meta = self.audit_metadata
+            meta["duration_ms"] = round((time.perf_counter() - started) * 1000, 2)
+            if meta["status"] is None:
+                meta["outcome"] = "incomplete"
+            elif meta["status"] == 200:
+                meta["outcome"] = "completed"
+            try:
+                self.server.audit.finish(request_id, meta)
+            except sqlite3.Error:
+                self.server.audit_write_errors += 1
+
+    def _do_POST(self):
         if not self.authorized():
             self.send_body(401, b'{"error":"Unauthorized"}')
             return
@@ -1583,6 +1644,16 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 else b'{"error":"Existing subscription OAuth login required; API keys refused"}',
             )
             return
+        meta = self.audit_metadata
+        if meta is not None:
+            meta["credential_ref"] = anonymous_ref(self.server.token, "credential", auth)
+            if agent == "codex":
+                meta["account_ref"] = anonymous_ref(
+                    self.server.token, "account", self.headers.get("chatgpt-account-id", ""),
+                )
+            source = self.headers.get("X-SecureMCP-Agent")
+            if agent == "xai" and source in {"Grok Build", "Antigravity SDK"}:
+                meta["agent"] = source
         try:
             if self.headers.get("Transfer-Encoding") or self.headers.get(
                 "Content-Encoding"
@@ -1591,9 +1662,16 @@ class GatewayHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
             if not 0 < length <= LIMIT:
                 raise ValueError("Request size limit exceeded.")
-            payload = json.loads(self.rfile.read(length))
+            raw = self.rfile.read(length)
+            if meta is not None:
+                meta["input_bytes"] = len(raw)
+            payload = json.loads(raw)
             if not isinstance(payload, dict):
                 raise ValueError("Request must be a JSON object.")
+            if meta is not None and isinstance(payload.get("model"), str):
+                model = payload["model"]
+                if re.fullmatch(r"[A-Za-z0-9_.:/-]{1,128}", model):
+                    meta["model"] = model
             # Refresh stays CLI-owned; changing bearer tokens must not change aliases.
             session = self.server.get_session(agent)
             with session.lock:
@@ -1604,7 +1682,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     if agent in API_AUTH_PREFIXES
                     else None
                 )
+                before = len(session.session.forward_store)
                 masked = session.request(payload, dialect=dialect)
+                if meta is not None:
+                    meta["new_aliases"] = max(0, len(session.session.forward_store) - before)
                 session.active_requests += 1
                 session.session.touch()
             try:
@@ -1631,9 +1712,12 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 ):
                     if self.headers.get(key):
                         headers[key] = self.headers[key]
+                masked_data = json.dumps(masked, ensure_ascii=False).encode()
+                if meta is not None:
+                    meta["masked_bytes"] = len(masked_data)
                 request = urllib.request.Request(
                     self.server.upstreams[agent] + path + ("?" + query if query else ""),
-                    data=json.dumps(masked, ensure_ascii=False).encode(),
+                    data=masked_data,
                     headers=headers,
                 )
                 # Disable redirects and environment proxies: credentials stay at the fixed origin.
@@ -1641,6 +1725,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     urllib.request.ProxyHandler({}), NoRedirect()
                 )
                 try:
+                    if meta is not None:
+                        meta["upstream_attempted"] = 1
+                        meta["outcome"] = "transport_error"
                     upstream_response = opener.open(request, timeout=180)
                 except urllib.error.HTTPError:
                     raise
@@ -1668,6 +1755,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     ):
                         content_type = "text/event-stream"
                     with session.lock:
+                        if meta is not None:
+                            meta["outcome"] = "restore_error"
                         restored = session.response(body, content_type, dialect=dialect)
                         self.server.save(agent, session)
                 self.send_body(200, restored, content_type)
@@ -1675,6 +1764,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 with session.lock:
                     session.active_requests -= 1
         except urllib.error.HTTPError as exc:
+            if meta is not None:
+                meta["outcome"] = "upstream_rejected"
             self.capture_response_headers(exc.headers)
             status, body = sanitized_upstream_error(exc)
             self.send_body(status, body)

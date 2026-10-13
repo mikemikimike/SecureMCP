@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SecureMCP · 관리자</title><link rel="icon" href="/admin/favicon.svg"><link rel="stylesheet" href="/admin/style.css">
+  <script src="/admin/app.js" defer></script>
+</head>
+<body>
+  <section id="login" class="login-shell">
+    <form id="login-form" class="login-card">
+      <div class="brand"><span class="brand-icon">S</span> SecureMCP</div>
+      <p class="eyebrow">LOCAL PRIVACY GATEWAY</p><h1>흐름을 확인하세요.</h1>
+      <p class="muted">에이전트에서 구독 제공자까지, 처리 경로와 결과를 한곳에서 확인합니다.</p>
+      <label for="token">관리자 인증 토큰</label>
+      <input id="token" type="password" autocomplete="off" required placeholder="게이트웨이 config.json의 token">
+      <button class="primary" type="submit">관리자 페이지 열기 <span>→</span></button>
+      <p id="login-error" class="error" role="alert"></p>
+      <p class="fine">토큰은 이 탭의 메모리에만 보관됩니다. 요청 원문·응답·인증 정보는 처리 로그에 저장하지 않습니다.</p>
+    </form>
+  </section>
+  <div id="dashboard" class="app-shell" hidden>
+    <aside class="sidebar">
+      <div class="brand"><span class="brand-icon">S</span> SecureMCP</div>
+      <div class="workspace"><span class="dot"></span> 로컬 게이트웨이 <small>PRIVACY FIRST</small></div>
+      <p class="nav-label">WORKSPACE</p><a href="#overview" class="nav-item active">◈ <span>처리 로그</span></a>
+      <div class="sidebar-bottom"><div class="local-note">SQLite 저장소<small>최근 100,000건 보관</small></div><button id="logout" class="quiet">로그아웃 ↗</button></div>
+    </aside>
+    <main id="overview">
+      <header><div><p class="eyebrow">GATEWAY OBSERVABILITY</p><h1>처리 로그</h1><p class="muted">어떤 에이전트가 어디로 요청했는지 확인하세요.</p></div><div class="header-tools"><label class="auto"><input id="auto-refresh" type="checkbox" checked> 자동 갱신</label><button id="refresh" class="secondary">↻ 새로고침</button></div></header>
+      <p id="banner" class="banner" role="alert" hidden></p>
+      <section class="stats" aria-label="처리 통계">
+        <article><span>전체 요청</span><strong id="stat-total">0</strong><small>현재 필터 기준</small></article>
+        <article><span>성공한 요청</span><strong id="stat-success">0</strong><small>HTTP 2xx</small></article>
+        <article><span>실패한 요청</span><strong id="stat-errors">0</strong><small>HTTP 4xx / 5xx</small></article>
+        <article><span>평균 처리 시간</span><strong id="stat-latency">0 <em>ms</em></strong><small>마스킹·중계·복원 포함</small></article>
+      </section>
+      <section class="routing"><div><h2>연결 경로</h2><p class="muted">활성화된 제공자와 인증 방식</p></div><div id="routes" class="route-list"></div></section>
+      <section class="log-panel">
+        <div class="panel-heading"><div><h2>요청 내역</h2><p id="updated" class="muted">불러오는 중…</p></div><span id="forwarded" class="pill">전송 시도 0건</span></div>
+        <form id="filters" class="filters">
+          <label>에이전트<select name="agent"><option value="">전체 에이전트</option><option>Claude Code</option><option>Codex</option><option>xAI client</option><option>Grok Build</option><option>Antigravity SDK</option></select></label>
+          <label>제공자<select name="provider"><option value="">전체 제공자</option><option value="claude">Anthropic</option><option value="codex">OpenAI</option><option value="xai">xAI</option></select></label>
+          <label>구독 / 인증<select name="subscription"><option value="">전체 인증</option><option value="claude_subscription">Claude 구독</option><option value="chatgpt_subscription">ChatGPT 구독</option><option value="api_key">xAI API 키</option></select></label>
+          <label>결과<select name="result"><option value="">모든 결과</option><option value="success">성공</option><option value="error">실패</option><option value="incomplete">진행 중 / 미완료</option></select></label>
+          <label>시작 일시<input name="since" type="datetime-local"></label>
+          <label>계정 ID<input name="account_ref" placeholder="익명 계정 ID" maxlength="16"></label>
+          <button type="reset" class="quiet reset">초기화</button>
+        </form>
+        <div class="table-scroll"><table><thead><tr><th>처리 일시</th><th>에이전트 / 모델</th><th>제공자 / 구독</th><th>익명 계정</th><th>결과</th><th>소요 시간</th><th><span class="sr-only">상세</span></th></tr></thead><tbody id="rows"></tbody></table></div>
+        <div id="empty" class="empty" hidden><span>◈</span><h3>아직 처리 내역이 없습니다</h3><p>게이트웨이를 통한 요청이 발생하면 여기에 표시됩니다.<br>필터를 설정했다면 조건을 변경해 보세요.</p></div>
+        <footer class="pagination"><span id="page-info">0건</span><div><button id="previous" class="secondary" disabled>← 이전</button><button id="next" class="secondary" disabled>다음 →</button></div></footer>
+      </section>
+      <p class="fine footer-note">전송 시도는 업스트림 연결 시도를 뜻합니다. 구독 요금제는 확인하지 않으며, 계정 ID가 제공되지 않은 요청은 자격 증명 ID로 구분할 수 있습니다. 원문과 인증 정보는 기록하지 않습니다.</p>
+    </main>
+  </div>
+  <dialog id="details"><div class="detail-heading"><h2>요청 상세</h2><button id="close-details" class="quiet" aria-label="닫기">✕</button></div><dl id="detail-fields"></dl><p class="fine">계정 ID는 전달된 식별자를 익명화한 값입니다. 자격 증명 ID는 토큰이 갱신되면 변경될 수 있으며, 구독 요금제나 결제 계정을 증명하지 않습니다.</p></dialog>
+</body>
+</html>

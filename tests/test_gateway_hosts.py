@@ -265,7 +265,8 @@ def test_native_subscription_cli_gateway(
     Thread(target=provider.serve_forever, daemon=True).start()
     upstream = f"http://127.0.0.1:{provider.server_port}"
     gateway = PrivacyGateway(
-        ("127.0.0.1", 0), "offline-local-token", {"claude": upstream, "codex": upstream}
+        ("127.0.0.1", 0), "offline-local-token", {"claude": upstream, "codex": upstream},
+        audit_path=tmp_path / "logs.sqlite3",
     )
     provider.gateway = gateway
     statuses = []
@@ -397,6 +398,11 @@ def test_native_subscription_cli_gateway(
             completed.stderr[-1000:],
         )
         assert provider.requests, "No fixture inference request received"
+        recorded = gateway.audit.query({"provider": agent})
+        assert any(row["outcome"] == "completed" for row in recorded["rows"])
+        assert all(row["agent"] == ("Claude Code" if agent == "claude" else "Codex")
+                   for row in recorded["rows"])
+        assert "offline-local-token" not in json.dumps(recorded)
         assert all(
             secret not in json.dumps(payload) for payload, _ in provider.requests
         )

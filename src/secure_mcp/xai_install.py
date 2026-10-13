@@ -74,7 +74,8 @@ def install_api(path: Path, model: str, port=38118, grok_dir=None):
             "base_url": f"http://127.0.0.1:{port}/xai/v1",
             "api_backend": "responses",
             "env_key": "XAI_API_KEY",
-            "extra_headers": {"X-SecureMCP-Token": config["token"]},
+            "extra_headers": {"X-SecureMCP-Token": config["token"],
+                              "X-SecureMCP-Agent": "Grok Build"},
             "supports_backend_search": False,
         }
         # Add an explicitly selectable model; do not change the user's default.

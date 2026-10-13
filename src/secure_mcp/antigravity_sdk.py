@@ -118,6 +118,7 @@ def antigravity_endpoint(gateway_origin: str, local_token: str, api_key: str):
                         "Content-Type": "application/json",
                         "X-SecureMCP-Token": local_token,
                         "Authorization": "Bearer " + api_key,
+                        "X-SecureMCP-Agent": "Antigravity SDK",
                     },
                 )
                 with opener.open(request, timeout=65) as response:

@@ -15,7 +15,7 @@
 
 ---
 
-[English](#english-overview) · [한국어 안내](#한국어-안내-korean-overview) · [Supported Versions](#supported-versions) · [Quick Start](#quick-start) · [Features](#features) · [Architecture](#system-architecture) · [Documentation](#documentation)
+[English](#english-overview) · [한국어 안내](#한국어-안내-korean-overview) · [Supported Versions](#supported-versions) · [Quick Start](#quick-start) · [설치·운영 가이드](#설치실행관리자-페이지종료삭제) · [Features](#features) · [Architecture](#system-architecture) · [Documentation](#documentation)
 
 ---
 
@@ -86,6 +86,198 @@ Restart Claude Code/Codex and use their normal commands. Setup preserves login c
 registers a hidden user-login startup task. It changes user-wide provider settings; no agent
 hooks are added. Subscription limits still apply. This is text/code inference protection;
 images, remote attachments and unsupported payloads are blocked. See [gateway guide](docs/GATEWAY.md).
+For the complete lifecycle, including the local dashboard and login, see
+[설치·운영 가이드](#설치실행관리자-페이지종료삭제).
+
+### 설치·실행·관리자 페이지·종료·삭제
+
+아래는 **Claude Code / Codex 구독 게이트웨이**의 전체 사용 순서입니다.
+Python 3.10 이상, `uv`, Git을 준비하고 사용할 에이전트에서 기존 구독 로그인을 완료하세요.
+관리자 웹페이지는 게이트웨이에 포함되어 있으며 별도 웹서버를 설치할 필요가 없습니다.
+
+#### 1. 패키지 설치와 최초 설정
+
+```bash
+git clone https://github.com/mj10612/SecureMCP.git
+cd SecureMCP
+uv tool install .
+secure-mcp gateway install
+secure-mcp gateway status
+```
+
+이미 저장소를 내려받았다면 해당 폴더에서 `uv tool install .`부터 실행하세요.
+`gateway install`은 기본적으로 Claude Code와 Codex의 사용자 설정을 백업·변경하고,
+게이트웨이를 즉시 백그라운드로 실행하며 **운영체제 사용자 로그인 시 자동 시작**을 등록합니다.
+기존 Claude/ChatGPT 로그인 파일은 변경하지 않습니다. 설치 후 실행 중이던 에이전트를
+종료하고 다시 실행해야 새 경로가 적용됩니다.
+
+한 에이전트만 설정하거나 포트를 바꾸려면 최초 설치 때 옵션을 지정하세요.
+
+```bash
+secure-mcp gateway install --agent codex
+# 또는 Claude Code만 설정
+secure-mcp gateway install --agent claude
+# 기본 포트 38117 대신 다른 포트 사용
+secure-mcp gateway install --port 38119
+```
+
+위 예시는 선택지이며 전부 실행할 필요는 없습니다. 기존 설치의 포트를 변경하려면
+먼저 `gateway uninstall`로 설정을 복원한 뒤 원하는 포트로 다시 설치하세요.
+`secure-mcp` 명령을 찾지 못한다면 `uv tool update-shell`을 실행하고 터미널을 다시 여세요.
+
+#### 2. 실행·상태 확인·재시작
+
+최초 설치 후에는 평소처럼 `claude` / `codex`를 실행하면 됩니다. 로그인 시 자동 시작된
+게이트웨이가 마스킹·중계·복원을 처리합니다. 상태는 다음 명령으로 확인합니다.
+
+```bash
+secure-mcp gateway status
+```
+
+이 명령은 서버 상태와 설치 파일 변경 여부를 확인합니다. 실제 추론 요청이 게이트웨이를
+통과하는지는 에이전트에서 요청을 보낸 뒤 관리자 페이지의 처리 로그로 확인하세요.
+
+수동 실행 또는 진단이 필요하면 기존 백그라운드 프로세스를 먼저 종료한 뒤 실행합니다.
+
+```bash
+secure-mcp gateway stop
+secure-mcp gateway run
+```
+
+`gateway run`은 **현재 터미널에서 계속 실행**되며 `Ctrl+C`로 종료합니다.
+이 상태에서 관리자 페이지를 열려면 다른 터미널을 사용하세요.
+종료한 게이트웨이를 다시 백그라운드로 실행하려면 설치 설정이 변경되지 않은 상태에서
+`secure-mcp gateway install`을 다시 실행할 수 있습니다.
+
+저장소의 최신 코드로 기존 패키지를 업데이트할 때는 다음 순서를 사용하세요.
+
+```bash
+secure-mcp gateway stop
+uv tool install --force .
+secure-mcp gateway install
+```
+
+이후 에이전트를 재시작하세요. 설치 뒤 호스트 설정이 수정됐다면 재설치·제거가 거부될 수
+있습니다. 오류가 가리키는 설정과 `installation.json`의 백업을 검토·병합한 뒤 재시도하세요.
+
+#### 3. 관리자 페이지 실행
+
+게이트웨이가 실행 중일 때 다음 명령으로 기본 브라우저를 엽니다.
+
+```bash
+secure-mcp gateway admin
+```
+
+기본 주소는 **http://127.0.0.1:38117/admin**입니다. 설치 시 포트를 변경했다면 해당 포트를
+사용하세요. `gateway admin`은 설정 파일에서 포트를 읽어 올바른 주소를 안내합니다.
+브라우저를 자동으로 열지 않고 주소만 확인하려면 다음 명령을 사용하세요.
+
+```bash
+secure-mcp gateway admin --no-open
+```
+
+이 명령은 게이트웨이를 새로 시작하지 않습니다. 서버가 중지됐다면 먼저 실행하세요.
+
+#### 4. 관리자 로그인과 로그 조회
+
+**설정 파일에 토큰이 있다고 자동 로그인되는 것은 아닙니다.** 브라우저는 로컬 설정 파일을
+읽지 않습니다. 다음 순서로 로그인하세요.
+
+1. 사용 중인 게이트웨이의 `config.json`을 로컬 편집기로 엽니다.
+2. JSON의 `token` 항목 값을 복사합니다. 값 주변의 큰따옴표는 제외합니다.
+3. 관리자 페이지의 **관리자 인증 토큰** 입력란에 붙여 넣습니다.
+4. **관리자 페이지 열기** 버튼을 누릅니다.
+
+| 운영체제 | 기본 설정 파일 |
+| --- | --- |
+| Windows | `%USERPROFILE%\.secure-mcp\gateway\config.json` |
+| macOS / Linux | `~/.secure-mcp/gateway/config.json` |
+
+이 토큰은 설치할 때 생성되는 **로컬 게이트웨이 접근 토큰**입니다. Claude/ChatGPT의
+구독 로그인 토큰이나 API 키를 입력하는 것이 아닙니다. 별도의 관리자 계정·비밀번호는
+없으며, 설정 파일의 토큰과 일치하면 관리자 로그를 조회할 수 있습니다.
+토큰은 URL에 넣거나 다른 사람에게 공유하지 마세요.
+
+토큰은 현재 브라우저 탭의 메모리에만 보관합니다. **브라우저 페이지를 새로고침(F5)하거나
+탭을 닫으면 다시 입력해야 하며**, 화면의 **로그아웃** 버튼을 누르면 토큰과 표시된 내역이
+지워집니다. 화면 안의 **새로고침** 버튼은 로그인 상태를 유지하면서 로그만 다시 조회합니다.
+로그아웃은 게이트웨이 종료나 SQLite 로그 삭제를 의미하지 않습니다.
+
+관리자 화면에서는 에이전트·제공자·구독/API 인증·결과·시작 일시·익명 계정 ID로 로그를
+필터링하고, 각 요청의 모델·목적지·HTTP 상태·전송 시도·처리 시간·바이트 수를 확인할 수
+있습니다. Claude 구독, ChatGPT 구독, xAI API 키 경로는 구분됩니다. 전달된 계정 식별자는
+익명화하며, 구독 요금제나 결제 계정을 확인할 수 없는 경우에는 **확인 불가**로 표시합니다.
+
+처리 내역은 `config.json` 옆의 **`logs.sqlite3`**에 저장하며 최근 **100,000건**을 보관합니다.
+요청·응답 원문, OAuth 토큰, API 키는 기록하지 않습니다. 재시작 후에도 로그는 유지됩니다.
+SQLite 로그는 게이트웨이를 종료한 뒤 백업하거나 SQLite 온라인 백업 기능을 사용하세요.
+
+#### 5. 사용자 지정 설정 파일과 xAI API 모드
+
+`--config`로 설치했다면 이후 명령에서도 **같은 설정 파일**을 지정해야 합니다.
+아래 경로는 실제 사용 중인 경로로 바꾸세요.
+
+```bash
+secure-mcp gateway install --config ./gateway-state/config.json
+secure-mcp gateway status --config ./gateway-state/config.json
+secure-mcp gateway admin --config ./gateway-state/config.json
+secure-mcp gateway stop --config ./gateway-state/config.json
+secure-mcp gateway uninstall --config ./gateway-state/config.json
+```
+
+수동 실행도 `gateway run --config ./gateway-state/config.json`을 사용합니다.
+관리자 로그인에는 이 파일의 `token`을 사용하고, 로그 DB는 같은 폴더에 저장됩니다.
+
+xAI API 모드는 구독 게이트웨이와 별도로 설정·실행하며 **별도 API 요금이 발생합니다**.
+설치는 [Grok / xAI 안내](docs/GROK.md)를 따르고, 실행에는 `gateway api-run`,
+제거에는 `gateway api-uninstall`을 사용하세요. 기본 설정은
+`~/.secure-mcp/xai-api/config.json`, 기본 포트는 `38118`입니다.
+관리자 화면은 동일한 명령으로 해당 설정 파일을 지정해 엽니다.
+
+```bash
+secure-mcp gateway admin --config /path/to/xai-api/config.json
+```
+
+#### 6. 종료·설정 해제·패키지 삭제
+
+| 원하는 작업 | 방법 | 남는 항목 |
+| --- | --- | --- |
+| 관리자 화면 로그아웃 | 화면의 **로그아웃** | 게이트웨이는 계속 실행되고 DB 로그는 유지 |
+| 현재 게이트웨이만 종료 | `secure-mcp gateway stop` 또는 수동 실행 터미널에서 `Ctrl+C` | 에이전트 설정·자동 시작 등록·로컬 데이터 유지 |
+| 게이트웨이 설정 해제 | `secure-mcp gateway uninstall` | 설정 복원 후 로컬 설정 파일·로그·세션 데이터 유지 |
+| 설치한 패키지 삭제 | 설정 해제 후 `uv tool uninstall secure-mcp` | 저장소와 로컬 데이터 유지 |
+
+`stop`만 실행하면 다음 운영체제 로그인 때 게이트웨이가 다시 시작될 수 있습니다.
+종료된 동안에는 게이트웨이를 사용하도록 설정된 에이전트 요청이 실패합니다.
+자동 시작 등록을 제거하고 에이전트의 기존 설정으로 돌아가려면 `uninstall`을 사용하세요.
+
+완전히 사용을 중단할 때의 순서는 다음과 같습니다.
+
+```bash
+secure-mcp gateway uninstall
+uv tool uninstall secure-mcp
+```
+
+`uninstall`은 실행 중인 게이트웨이를 종료하고, 백업한 에이전트 설정과 자동 시작 파일을
+설치 전 상태로 복원합니다. 성공한 뒤 에이전트를 재시작하세요. 설치 후 수정된 파일을
+덮어쓰지 않도록 제거가 거부되면 먼저 설정을 검토·병합해야 합니다. **설정 복원이 완료되기
+전에 패키지나 백업을 삭제하지 마세요.** xAI API 설정도 사용했다면 패키지를 삭제하기 전에
+`gateway api-uninstall`도 실행하세요.
+
+복구용 설정·SQLite 로그·암호화 세션은 자동으로 삭제하지 않습니다. 제거가 성공하고
+게이트웨이가 종료된 것을 확인한 뒤, 데이터까지 삭제하려면 필요한 로그를 먼저 백업하고
+해당 데이터 폴더를 수동 삭제하세요.
+
+| 설치 방식 | 삭제할 데이터 폴더 |
+| --- | --- |
+| 기본 구독 게이트웨이 | Windows: `%USERPROFILE%\.secure-mcp\gateway` / macOS·Linux: `~/.secure-mcp/gateway` |
+| 기본 xAI API 게이트웨이 | Windows: `%USERPROFILE%\.secure-mcp\xai-api` / macOS·Linux: `~/.secure-mcp/xai-api` |
+| 사용자 지정 설정 | 지정한 `config.json`의 부모 폴더에서 SecureMCP 데이터만 삭제 |
+
+사용자 지정 폴더에 다른 파일이 있다면 폴더 전체를 삭제하지 마세요. 소스 저장소는 패키지
+제거와 별개이므로 더 이상 필요하지 않을 때 직접 삭제할 수 있습니다.
+
+자세한 보호 범위와 오류 진단은 [게이트웨이 안내](docs/GATEWAY.md)를 참고하세요.
 
 ### Legacy optional agent hooks
 
@@ -146,6 +338,7 @@ with LocalPrivacyClient() as client:
 | 🧩 Code-aware masking | Language-specific lexer modes for identifiers, literals, numbers and comments |
 | 🎭 Four surrogate strategies | Bracket, Unicode, delimited pseudoword and random hash representations |
 | 🔁 Subscription gateway | Automatic request masking, shared prompt/code aliases, local tool-argument restoration and automatic answer display; existing OAuth, no API-key fallback |
+| 📊 Local admin dashboard | Token-authenticated log viewer, routing/account metadata, filters and request details; SQLite storage, no prompt/reply/credential logging |
 | 🔌 Local agent hooks | Claude Code and Codex tool-text masking and local execution-argument restoration; Claude Code also supports display-only restoration |
 | 🔐 Session management | Stable per-session mappings, operation locks, idle expiry and opt-in encrypted snapshots |
 | 🛠️ CLI & Python API | Local masking/restoration, hook diagnostics, statistics and a buffered command wrapper |

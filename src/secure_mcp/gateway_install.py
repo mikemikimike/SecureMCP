@@ -211,6 +211,36 @@ def stop_gateway(path: Path):
     return True
 
 
+def codex_settings_homes(codex_dir: Path | None = None) -> list[Path]:
+    """Orca mirrors canonical user config into its marked account homes."""
+    home = codex_dir or Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
+    if codex_dir is not None:
+        return [home]
+    orca_home = os.environ.get("ORCA_CODEX_HOME")
+    if (
+        orca_home
+        and Path(orca_home).resolve() == home.resolve()
+        and (home / ".orca-managed-home").is_file()
+    ):
+        canonical = Path.home() / ".codex"
+        if canonical.resolve() != home.resolve():
+            return [canonical, home]
+    return [home]
+
+
+def changed_installation_files(path: Path) -> list[str] | None:
+    """Check installation ownership without exposing settings or credentials."""
+    manifest_path = path.parent / "installation.json"
+    if not manifest_path.exists():
+        return None
+    manifest = load_installation_manifest(manifest_path)
+    return [
+        name for name, record in manifest["files"].items()
+        if not Path(name).is_file()
+        or sha256(Path(name).read_bytes()).hexdigest() != record["installed_sha256"]
+    ]
+
+
 def install_gateway(
     path: Path,
     agent="both",
@@ -347,10 +377,7 @@ def _install_gateway(path: Path, agent, port, claude_dir, codex_dir, startup_pat
         changes[settings] = (
             json.dumps(value, ensure_ascii=False, indent=2) + "\n"
         ).encode()
-    if agent in {"codex", "both"}:
-        home = codex_dir or Path(
-            os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))
-        )
+    for home in codex_settings_homes(codex_dir) if agent in {"codex", "both"} else []:
         settings = home / "config.toml"
         value = (
             tomlkit.parse(settings.read_text(encoding="utf-8"))

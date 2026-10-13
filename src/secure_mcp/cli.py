@@ -6,6 +6,7 @@ from contextlib import contextmanager, nullcontext
 from pathlib import Path
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import time
@@ -572,11 +573,33 @@ def gateway_run(config, mapping_limit):
             ("127.0.0.1", settings["port"]),
             settings["token"],
             state_dir=state,
+            audit_path=state.parent / "logs.sqlite3",
             mapping_limit=mapping_limit or settings.get("mapping_limit", 100_000),
         ) as server:
             server.serve_forever()
+    except (ValueError, OSError, sqlite3.Error) as exc:
+        raise click.ClickException(str(exc)) from None
+
+
+@gateway.command("admin")
+@click.option("--config", type=click.Path(path_type=Path))
+@click.option("--no-open", is_flag=True, help="Print the local URL without opening a browser.")
+def gateway_admin(config, no_open):
+    """Open the local processing-log dashboard. Sign in with the config token."""
+    from secure_mcp.gateway_install import default_config, healthy, load_config
+
+    path = config or default_config()
+    try:
+        settings = load_config(path)
+        if not healthy(settings):
+            raise ValueError("Start the gateway before opening the admin dashboard.")
     except (ValueError, OSError) as exc:
         raise click.ClickException(str(exc)) from None
+    url = f"http://127.0.0.1:{settings['port']}/admin"
+    click.echo(url)
+    click.echo(f"Sign in with the token from {path.resolve()} (never put it in the URL).")
+    if not no_open:
+        click.launch(url)
 
 
 @gateway.command("uninstall")
@@ -596,19 +619,30 @@ def gateway_uninstall(config):
 @click.option("--config", type=click.Path(path_type=Path))
 def gateway_status(config):
     """Check the authenticated local gateway without contacting a provider."""
-    from secure_mcp.gateway_install import default_config, healthy, load_config
+    from secure_mcp.gateway_install import (
+        changed_installation_files, default_config, healthy, load_config,
+    )
 
     try:
-        ready = healthy(load_config(config or default_config()))
+        path = config or default_config()
+        ready = healthy(load_config(path))
+        changed = changed_installation_files(path) if ready else None
     except (ValueError, OSError):
         ready = False
-    click.echo(
-        "Subscription gateway ready"
-        if ready
-        else "Subscription gateway stopped or unconfigured"
-    )
     if not ready:
+        click.echo("Subscription gateway stopped or unconfigured")
         raise click.exceptions.Exit(1)
+    if changed:
+        click.echo("Gateway running, but installed settings changed or are missing; agent routing is unverified.")
+        for name in changed:
+            click.echo(name)
+        raise click.exceptions.Exit(1)
+    click.echo(
+        "Subscription gateway ready; installed settings verified. Restart existing agent sessions to apply routing."
+        if changed is not None
+        else "Gateway running; no installation record available to verify agent routing."
+    )
+    click.echo("Server health does not prove inference requests are using the gateway.")
 
 
 @gateway.command("reset")
@@ -697,9 +731,10 @@ def gateway_api_run(config):
             api_upstreams={"xai": API_UPSTREAMS["xai"]},
             mapping_limit=settings.get("mapping_limit", 100_000),
             state_dir=path.resolve().parent / "sessions",
+            audit_path=path.resolve().parent / "logs.sqlite3",
         ) as server:
             server.serve_forever()
-    except (ValueError, OSError) as exc:
+    except (ValueError, OSError, sqlite3.Error) as exc:
         raise click.ClickException(str(exc)) from None
 
 
