@@ -46,7 +46,8 @@ def handle_admin(handler):
     try:
         if len(url.query) > 2048:
             raise ValueError("Query too large")
-        params = parse_qs(url.query, keep_blank_values=True, strict_parsing=True)
+        # Python 3.10 rejects an empty query when strict_parsing is enabled.
+        params = parse_qs(url.query, keep_blank_values=True, strict_parsing=True) if url.query else {}
         allowed = {"agent", "provider", "subscription", "account_ref", "result",
                    "since", "until", "limit", "offset"}
         if set(params) - allowed or any(len(v) != 1 for v in params.values()):

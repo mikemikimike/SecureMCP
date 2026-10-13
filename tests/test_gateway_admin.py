@@ -1,6 +1,7 @@
 """Durable metadata, route attribution and authenticated dashboard contracts."""
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import sqlite3
@@ -126,6 +127,9 @@ def test_dashboard_auth_origin_assets_and_filters(admin_gateway):
         assert "frame-ancestors 'none'" in headers["Content-Security-Policy"]
         assert gateway.token.encode() not in body
     assert call(gateway, "/admin/api/logs", headers={})[0] == 401
+    for path in ("/admin/api/logs", "/admin/api/logs?"):
+        status, body, _ = call(gateway, path)
+        assert status == 200 and json.loads(body)["rows"] == []
     assert call(gateway, "/admin/api/logs", headers={"X-SecureMCP-Token": "한글".encode().decode("latin1")})[0] == 401
     assert call(gateway, "/admin/api/logs", headers={"Host": "attacker.example", "X-SecureMCP-Token": gateway.token})[0] == 403
     assert call(gateway, "/admin/api/logs", headers={"Origin": "https://attacker.example", "X-SecureMCP-Token": gateway.token})[0] == 403
@@ -210,11 +214,11 @@ def test_admin_command_never_prints_token(tmp_path, monkeypatch):
 
 def test_unknown_database_version_is_not_modified(tmp_path):
     path = tmp_path / "logs.sqlite3"
-    with sqlite3.connect(path) as db:
+    with closing(sqlite3.connect(path)) as db, db:
         db.execute("PRAGMA user_version=99")
     with pytest.raises(ValueError, match="version"):
         AuditStore(path)
-    with sqlite3.connect(path) as db:
+    with closing(sqlite3.connect(path)) as db, db:
         assert db.execute("PRAGMA user_version").fetchone()[0] == 99
 
 
