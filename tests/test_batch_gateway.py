@@ -409,4 +409,3 @@ def test_negative_numeric_json_alias_keeps_its_unary_sign():
     mapping = next(mapping for mapping in session.session.forward_store.values()
                    if mapping.token_type == TokenType.NUMBER)
     assert session.values({"value": -int(mapping.surrogate)}, restore=True) == {"value": -42}
-
