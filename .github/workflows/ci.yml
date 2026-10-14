@@ -41,3 +41,21 @@ jobs:
 
       - name: Type check
         run: python -m mypy src
+
+  package:
+    name: Distribution smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@v2
+      - name: Build wheel and source distribution
+        run: uv build
+      - name: Install distributions outside the source tree
+        run: python scripts/package_smoke.py

@@ -66,15 +66,20 @@ def antigravity_endpoint(gateway_origin: str, local_token: str, api_key: str):
             super().setup()
             self.connection.settimeout(10)
 
-        def error(self, status):
+        def error(self, status, headers=None):
             self.respond(
-                status, b'{"error":"SDK gateway request refused"}', "application/json"
+                status, b'{"error":"SDK gateway request refused"}', "application/json", headers
             )
 
-        def respond(self, status, body, content_type):
+        def respond(self, status, body, content_type, headers=None):
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
+            for key, value in (headers.items() if headers is not None else []):
+                if key.lower() in {"retry-after", "x-should-retry"} or key.lower().startswith(
+                    ("anthropic-ratelimit-", "x-ratelimit-")
+                ):
+                    self.send_header(key, value)
             self.end_headers()
             self.wfile.write(body)
 
@@ -130,11 +135,11 @@ def antigravity_endpoint(gateway_origin: str, local_token: str, api_key: str):
                     }:
                         self.error(502)
                         return
-                    self.respond(response.status, result, content_type)
+                    self.respond(response.status, result, content_type, response.headers)
             except urllib.error.HTTPError as exc:
                 status = exc.code if 400 <= exc.code <= 599 else 502
                 exc.close()
-                self.error(status)
+                self.error(status, exc.headers)
             except (OSError, ValueError, urllib.error.URLError, HTTPException):
                 self.error(502)
 

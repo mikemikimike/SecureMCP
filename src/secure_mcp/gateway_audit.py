@@ -86,7 +86,7 @@ class AuditStore:
 
     def query(self, filters, limit=50, offset=0):
         clauses, values = [], []
-        for field in ("agent", "provider", "subscription", "account_ref"):
+        for field in ("agent", "provider", "subscription", "account_ref", "credential_ref"):
             if filters.get(field):
                 clauses.append(f"{field}=?")
                 values.append(filters[field])

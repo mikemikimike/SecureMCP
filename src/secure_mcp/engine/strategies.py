@@ -36,6 +36,7 @@ class StrategyGenerator:
         self.used_surrogates: set[str] = set()
         self._type_counters: dict[TokenType, int] = {}
         self._code_index = 0
+        self.max_mappings = 100_000
 
     @contextmanager
     def operation(self) -> Iterator[None]:
@@ -102,6 +103,7 @@ class StrategyGenerator:
             pattern = r"⟪[^⟪⟫\n]+⟫"
         return re.compile(
             pattern
-            + r"|\b(?:smcp_(?:ID|NUM|LIT)|private_symbol)_\d+\b|\b732846\d{12}\b",
+            + r"|(?<![A-Za-z0-9_])(?:smcp_(?:ID|NUM|LIT)|private_symbol)_\d+(?![A-Za-z0-9_])"
+            + r"|(?<![A-Za-z0-9_])732846\d{12}(?![A-Za-z0-9_])",
             re.IGNORECASE,
         )

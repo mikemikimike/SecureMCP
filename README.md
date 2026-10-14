@@ -6,7 +6,7 @@
 
 *영어·한국어·코드를 로컬에서 마스킹하고, 도구 실행과 사용자 화면에서 원문을 복원하는 개인정보 보호 도구*
 
-[![Version](https://img.shields.io/badge/version-0.5.2-blue.svg)](pyproject.toml)
+[![Version](https://img.shields.io/badge/version-0.6.0-blue.svg)](pyproject.toml)
 [![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-brightgreen.svg)](pyproject.toml)
 [![Platforms](https://img.shields.io/badge/Platforms-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)](.github/workflows/ci.yml)
 [![CI](https://github.com/mj10612/SecureMCP/actions/workflows/ci.yml/badge.svg)](https://github.com/mj10612/SecureMCP/actions/workflows/ci.yml)
@@ -36,8 +36,9 @@ Legacy agent hooks remain optional utilities. They cover selected tool text rath
 complete requests; [local integration](docs/LOCAL_INTEGRATION.md) documents their limits.
 
 Other hosts have explicit support levels in the [compatibility table](docs/COMPATIBILITY.md).
-[Antigravity](docs/ANTIGRAVITY.md) provides verified stdio MCP utility integration;
-SDK gateway authentication is currently blocked by SDK 0.1.20's header configuration limits.
+[Antigravity](docs/ANTIGRAVITY.md) provides verified stdio MCP utility integration.
+SDK 0.1.21 uses a context-owned authenticated bridge to the explicit xAI API gateway;
+native file reads and restoration are verified offline, with separate API billing.
 The separate [xAI API mode and Grok custom model](docs/GROK.md) require opt-in and incur
 API charges, independently of Claude/Codex or Grok subscriptions.
 
@@ -53,7 +54,7 @@ This is heuristic masking, not a proof of anonymity, cryptographic zero knowledg
 
 | Component | Supported versions / scope |
 | :--- | :--- |
-| SecureMCP | **0.5.2** |
+| SecureMCP | **0.6.0** |
 | Python | **3.10 · 3.11 · 3.12 · 3.13 · 3.14** in CI; package requires Python ≥ 3.10 |
 | Operating systems | **Windows · macOS · Linux** in CI |
 | Claude Code gateway | **2.1.287 / Sonnet 5.5** native fixtures and live subscription file-read/masking/restoration verified in English and Korean |
@@ -428,7 +429,8 @@ python -m secure_mcp mask "john doe" --mode entities_only --sensitive-term "john
 Use the same hidden password, or `SECURE_MCP_SESSION_PASSWORD`. CLI files use authenticated
 Fernet encryption, random salt, PBKDF2-HMAC-SHA256 with 600,000 iterations, atomic writes and a
 lock over the complete CLI read/modify/write operation. A concurrent writer fails clearly.
-A crash may leave `example.enc.lock`; remove it only after confirming no writer is running.
+Marked `.lock` files are persistent and their OS locks are released after a crash; retain
+these files. Only legacy empty locks require manual migration after all old writers stop.
 Files are opt-in; without `--session-file`, mappings only survive in the current process.
 Payload schema v2 stores allocations/counters without regenerating mappings. Legacy v1 files
 remain readable; unknown schema versions fail explicitly. Delete session files after use.
@@ -443,6 +445,23 @@ Library users must use `session.operation()` for custom mutations; built-in engi
 use the same lock. `vault.close()` stops cleanup and releases all mapping references. Python
 cannot promise byte-level memory zeroization. Standalone `PrivacySession` owners manage lifetime
 themselves; use `SessionVault` for scheduled expiry.
+
+Version 0.6 adds UTF-8 stdin and `--input-file` for `mask`/`unmask`, configurable MCP
+resource limits, and local Hook snapshot diagnostics:
+
+```bash
+secure-mcp mask --input-file private.txt --session-file example.enc --json-output
+secure-mcp state status
+secure-mcp state gc             # read-only preview
+secure-mcp state gc --apply     # retire expired snapshots; use new conversations
+secure-mcp gateway diagnostics
+```
+
+MCP defaults are 1,000 sessions, 100,000 mappings per session, and 16 MiB per input.
+`serve --max-sessions`, `--mapping-limit`, and `--input-limit` configure them. Gateway
+defaults admit 32 inference requests globally and eight per provider; JSON configuration
+keys are `max_active_requests` and `max_provider_requests`. See the integration guides
+for command limits, safe cleanup, and supported schema constraints.
 
 `masked_ratio` counts masked token occurrences divided by non-whitespace/non-punctuation
 occurrences. Deprecated `privacy_entropy_score` is an alias, not information entropy.

@@ -27,6 +27,15 @@ function detail(row) {
   };
   $("detail-fields").replaceChildren(...Object.entries(fields).flatMap(([key, value]) => [element("dt", key), element("dd", String(value))]));
   $("details").showModal();
+  if (row.credential_ref) {
+    const filterButton = element("button", "이 자격 증명의 요청 보기", "secondary");
+    filterButton.addEventListener("click", () => {
+      $("filters").elements.namedItem("credential_ref").value = row.credential_ref;
+      offset = 0; $("details").close(); load();
+    });
+    const action = element("dd"); action.append(filterButton);
+    $("detail-fields").append(element("dt", "요청 필터"), action);
+  }
 }
 function render(data) {
   $("stat-total").textContent = num(data.summary.total);

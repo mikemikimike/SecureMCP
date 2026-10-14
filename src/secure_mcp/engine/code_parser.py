@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import keyword
 import re
+import io
+import tokenize as python_tokenize
 
 from secure_mcp.models import TokenType
 
@@ -32,7 +34,14 @@ LANGUAGE_KEYWORDS: dict[str, set[str]] = {
     ),
 }
 LANGUAGE_KEYWORDS["typescript"] |= LANGUAGE_KEYWORDS["javascript"]
-LANGUAGE_KEYWORDS["c"] = LANGUAGE_KEYWORDS["cpp"]
+LANGUAGE_KEYWORDS["c"] = set(
+    "auto break case char const continue default do double else enum extern float "
+    "for goto if inline int long register restrict return short signed sizeof static "
+    "struct switch typedef union unsigned void volatile while _Alignas _Alignof "
+    "_Atomic _Bool _Complex _Generic _Imaginary _Noreturn _Static_assert _Thread_local "
+    "alignas alignof bool constexpr false nullptr static_assert thread_local true "
+    "typeof typeof_unqual _BitInt".split()
+)
 # Compatibility export; classification always consults the selected language.
 CODE_KEYWORDS = set().union(*LANGUAGE_KEYWORDS.values())
 ALIASES = {
@@ -77,29 +86,54 @@ def detect_language(code: str, language: str = "auto") -> str:
     )
 
 
-def quoted_end(code: str, start: int, quote: str, formatted: bool = False) -> int:
+def quoted_end(
+    code: str, start: int, quote: str, formatted: bool = False,
+    *, language: str = "python", raw: bool = False,
+) -> int:
     """Walk escapes and f-string expression nesting, including same-quote strings."""
     i = start + len(quote)
     depth = 0
     while i < len(code):
-        if code[i] == "\\":
+        if code[i] == "\\" and not raw and language != "sql":
             i += 2
             continue
-        if formatted and code[i] == "{" and not code.startswith("{{", i):
+        if depth and language == "python" and code[i] == "#":
+            newline = code.find("\n", i)
+            i = newline if newline >= 0 else len(code)
+            continue
+        if depth and language in {"javascript", "typescript"}:
+            if code.startswith("//", i):
+                newline = code.find("\n", i)
+                i = newline if newline >= 0 else len(code)
+                continue
+            if code.startswith("/*", i):
+                end = code.find("*/", i + 2)
+                if end < 0:
+                    raise ValueError("Unterminated block comment")
+                i = end + 2
+                continue
+        template = formatted and quote == "`"
+        if template and not depth and code.startswith("${", i):
+            depth = 1
+            i += 2
+            continue
+        if formatted and code[i] == "{" and (
+            depth or (not template and not code.startswith("{{", i))
+        ):
             depth += 1
         elif formatted and depth and code[i] == "}":
             depth -= 1
         elif depth and code[i] in "\"'`":
             inner = code[i] * 3 if code.startswith(code[i] * 3, i) else code[i]
-            i = quoted_end(code, i, inner)
+            i = quoted_end(code, i, inner, inner == "`", language=language)
             continue
         elif not depth and code.startswith(quote, i):
             # SQL doubled quotes are part of the same string.
-            if len(quote) == 1 and code.startswith(quote * 2, i):
+            if language == "sql" and len(quote) == 1 and code.startswith(quote * 2, i):
                 i += 2
                 continue
             return i + len(quote)
-        if formatted and code.startswith("{{", i) and not depth:
+        if formatted and not template and code.startswith("{{", i) and not depth:
             i += 2
         else:
             i += 1
@@ -108,7 +142,111 @@ def quoted_end(code: str, start: int, quote: str, formatted: bool = False) -> in
     )
 
 
+def _python_soft_positions(code: str) -> set[tuple[int, int]]:
+    """Locate contextual keywords without requiring this host's Python grammar."""
+    soft = set()
+    statement: list[python_tokenize.TokenInfo] = []
+
+    def inspect_statement():
+        if not statement or statement[0].string not in {"match", "case", "type"}:
+            return
+        first = statement[0]
+        depth = 0
+        guard = False
+        wildcards = []
+        for offset, item in enumerate(statement[1:], 1):
+            word = item.string
+            if not depth and word == "if":
+                guard = True
+            if first.string == "case" and word == "_" and not guard:
+                previous = statement[offset - 1].string
+                following = statement[offset + 1].string if offset + 1 < len(statement) else ""
+                if previous != "." and following != "=":
+                    wildcards.append(item.start)
+            if word in {"(", "[", "{"}:
+                depth += 1
+            elif word in {")", "]", "}"}:
+                depth -= 1
+            elif not depth and word == "=":
+                if first.string == "type" and len(statement) > 2 and statement[1].type == python_tokenize.NAME:
+                    soft.add(first.start)
+                return
+            elif not depth and word == ":":
+                if first.string in {"match", "case"}:
+                    soft.add(first.start)
+                    soft.update(wildcards)
+                return
+
+    try:
+        for item in python_tokenize.generate_tokens(io.StringIO(code).readline):
+            if item.type in {python_tokenize.NEWLINE, python_tokenize.ENDMARKER} or item.string == ";":
+                inspect_statement()
+                statement = []
+            elif item.type not in {python_tokenize.NL, python_tokenize.INDENT, python_tokenize.DEDENT,
+                                   python_tokenize.COMMENT, python_tokenize.ENCODING}:
+                statement.append(item)
+    except (python_tokenize.TokenError, IndentationError):
+        inspect_statement()
+    return soft
+
+
+def _regex_allowed(tokens: list[tuple[str, TokenType, str]]) -> bool:
+    previous_token = next((token for token in reversed(tokens)
+                           if token[2] not in {"whitespace", "comment"}), None)
+    if previous_token is None:
+        return True
+    raw, _, kind = previous_token
+    if kind == "keyword":
+        return raw in {"return", "throw", "case", "delete", "void", "typeof", "yield", "await", "else", "do", "in"}
+    if raw in {")", "}", "+", "-"}:
+        significant = [token for token in tokens if token[2] not in {"whitespace", "comment"}]
+    if raw in {")", "}"}:
+        depth = 1
+        for offset in range(len(significant) - 2, -1, -1):
+            previous = significant[offset][0]
+            opening = "(" if raw == ")" else "{"
+            depth += (previous == raw) - (previous == opening)
+            if depth == 0:
+                before = significant[offset - 1][0] if offset else ""
+                if raw == ")":
+                    return before in {"if", "while", "for", "with", "switch", "catch"}
+                # Object literals end expressions; statement blocks permit a
+                # following regex statement. Arrow function bodies are blocks.
+                arrow = before == ">" and offset > 1 and significant[offset - 2][0] == "="
+                return arrow or before not in {"=", "(", "[", ",", ":", "return"}
+        return False
+    if kind != "syntax":
+        return False
+    if raw in {"+", "-"} and len(significant) > 1 and significant[-2][0] == raw:
+        return False
+    return raw in {"=", "(", "[", "{", "}", ",", ";", ":", "?", "!", "~", "+", "-", "*", "%", "&", "|", "^", "<", ">", "/"}
+
+
+def _regex_end(code: str, start: int) -> int:
+    i = start + 1
+    character_class = False
+    while i < len(code) and code[i] not in "\r\n":
+        if code[i] == "\\":
+            i += 2
+            continue
+        if code[i] == "[":
+            character_class = True
+        elif code[i] == "]":
+            character_class = False
+        elif code[i] == "/" and not character_class:
+            i += 1
+            while i < len(code) and code[i].isalpha():
+                i += 1
+            return i
+        i += 1
+    raise ValueError("Unterminated regular expression literal")
+
+
 def literal_parts(value: str, subkind: str) -> tuple[str, str]:
+    if subkind == "regex":
+        suffix = re.search(r"/[A-Za-z]*$", value)
+        assert suffix is not None
+        return "/", suffix[0]
     if subkind == "header":
         return "<", ">"
     if subkind == "diagnostic":
@@ -139,6 +277,9 @@ class CodeParser:
         directive = None
         expect_header = expect_pragma = False
         at_line_start = True
+        soft_positions = _python_soft_positions(code) if language == "python" else set()
+        line_starts = [0] + [match.end() for match in re.finditer("\n", code)]
+        soft_offsets = {line_starts[row - 1] + column for row, column in soft_positions}
         while i < len(code):
             start = i
             c = code[i]
@@ -187,14 +328,24 @@ class CodeParser:
                 token_type, kind = TokenType.LITERAL, "header"
             elif comment:
                 if comment == "/*":
-                    end = code.find("*/", i + 2)
-                    if end < 0:
-                        raise ValueError("Unterminated block comment")
-                    i = end + 2
+                    depth = 1
+                    i += 2
+                    while depth:
+                        boundary = re.search(r"/\*|\*/", code[i:])
+                        if boundary is None:
+                            raise ValueError("Unterminated block comment")
+                        i += boundary.end()
+                        if boundary[0] == "*/":
+                            depth -= 1
+                        elif language == "rust":
+                            depth += 1
                 else:
                     end = code.find("\n", i)
                     i = end if end >= 0 else len(code)
                 token_type, kind = TokenType.LITERAL, "comment"
+            elif c == "/" and language in {"javascript", "typescript"} and _regex_allowed(tokens):
+                i = _regex_end(code, i)
+                token_type, kind = TokenType.LITERAL, "regex"
             elif cpp or rust:
                 match = cpp or rust
                 assert match is not None
@@ -207,13 +358,14 @@ class CodeParser:
             elif c == "`":
                 # A whole template is opaque: interpolation also contains private symbols.
                 i = quoted_end(
-                    code, i, "`", formatted=language in {"javascript", "typescript"}
+                    code, i, "`", formatted=language in {"javascript", "typescript"},
+                    language=language, raw=language == "go",
                 )
                 token_type, kind = TokenType.LITERAL, "string"
             elif (
                 language == "rust"
-                and re.match(r"'[A-Za-z_]\w*(?!')", code[i:])
-                and not re.match(r"'[^'\n]+'", code[i:])
+                and (lifetime := re.match(r"'[^\W\d]\w*", code[i:]))
+                and not code.startswith("'", i + len(lifetime[0]))
             ):
                 # Lifetime punctuation is structural; its name is processed next.
                 i += 1
@@ -222,8 +374,9 @@ class CodeParser:
                 assert match is not None
                 quote = match[1]
                 qstart = i + len(match[0]) - len(quote)
-                i = quoted_end(code, qstart, quote, "f" in match[0].lower())
-                token_type, kind = TokenType.LITERAL, "string"
+                i = quoted_end(code, qstart, quote, "f" in match[0].lower(), language=language)
+                kind = "character" if quote == "'" and language in {"rust", "java", "c", "cpp", "go"} else "string"
+                token_type = TokenType.LITERAL
             elif c.isdigit() or (
                 c == "." and i + 1 < len(code) and code[i + 1].isdigit()
             ):
@@ -245,9 +398,8 @@ class CodeParser:
                         reserved = True
                     if expect_pragma and word == "once":
                         reserved = True
-                    if language == "python" and word in {"match", "case"}:
-                        line = code[code.rfind("\n", 0, start) + 1 :]
-                        reserved = bool(re.match(r"\s*(?:match|case)\s+[^=\n]+:", line))
+                    if language == "python" and word in {"match", "case", "type", "_"}:
+                        reserved = start in soft_offsets
                     token_type, kind = (
                         (TokenType.GRAMMAR, "keyword")
                         if reserved

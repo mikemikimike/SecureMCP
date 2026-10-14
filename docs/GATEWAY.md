@@ -1,6 +1,6 @@
 # Automatic subscription integration
 
-SecureMCP 0.5.2 provides an experimental authenticated loopback gateway for Claude Code and
+SecureMCP 0.6.0 provides an experimental authenticated loopback gateway for Claude Code and
 Codex. Set it up once, then use their normal commands. Requests are masked automatically;
 replies and tool arguments are restored before the CLI displays or executes them. The next
 request masks restored history again. No agent hooks are registered.
@@ -193,7 +193,32 @@ Recognized public JSON Schema dialect URIs in `$schema` stay unchanged; other
 remain masked, including URI literals in source. `enum`/`const`/`default`/`examples` values
 are treated as data: protocol-named keys such as `id`, `type` or `cache_control` inside
 them are still masked. Operational schema fields and JSON scalar numeric parameters retain
-their types; numbers in source text are masked.
+their types; numbers in source text are masked. Registered numeric aliases returned as JSON
+integers are restored only when their original is a valid JSON numeric literal. Precision-lost
+float aliases and non-JSON originals are rejected. Character literals become opaque identifier
+expressions in the review representation and restore with their original quotes and escapes.
+
+Schema `minLength`, `maxLength`, `format`, and regex constraints are rejected explicitly:
+private string aliases cannot reliably satisfy the original value constraints. Nested schema
+positions, including additional/unevaluated items, follow the same rule. Local pointers decode
+URI percent escapes and follow schema structure, so names equal to schema keywords stay valid.
+
+SSE accepts LF, CRLF, CR and an initial UTF-8 BOM. Public refusal and reasoning summary text
+are grouped separately by content/summary index before restoration; signed reasoning remains
+opaque. Malformed upstream JSON/SSE returns 502, while malformed local requests remain 400.
+
+Gateway JSON keys `max_active_requests` (default 32) and `max_provider_requests` (default 8)
+must be positive integers. Capacity rejection occurs before reading the inference body, with
+429 and Retry-After; shutdown rejects new work and drains admitted requests before deleting
+mapping state. Health/admin remain independent of inference admission. `gateway diagnostics`
+and authenticated `/admin/api/sessions` show aggregate mapping usage, activity, and expiry.
+The logs API and dashboard accept `credential_ref` filters for accounts without an account ID.
+Anonymous credential references may change on token refresh and do not prove account ownership.
+
+Installation writes a recovery journal before changing any managed settings. Retry install or
+uninstall to roll interrupted changes back when bytes match recorded original/applied states;
+later user edits are refused. Antigravity has an independent journal. Native control requests
+reject redirects, and `gateway stop` waits for health to disappear after a successful ACK.
 
 The local recursive root reference `$ref: "#"` is supported unchanged. Named anchor
 references (`#node`, `$anchor`) are not supported; use root or `#/...` pointers.

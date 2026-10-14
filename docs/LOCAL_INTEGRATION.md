@@ -169,8 +169,12 @@ secure-mcp stats --session-id example
 The wrapper accepts an executable and argument list, with no implicit shell. For pipelines,
 invoke a shell explicitly. It restores known placeholders in the arguments, captures UTF-8
 stdout/stderr locally, masks them before returning either stream, and preserves the exit code.
-Masking failure returns no raw captured output. Execution is buffered, not interactive streaming;
-large/unbounded output is unsuitable. Match the host's `session_id` if using the same mappings
+Masking or UTF-8 decoding failure returns no raw captured output. Execution is buffered, not
+interactive streaming. Defaults are 180 seconds and 16 MiB combined stdout/stderr; configure
+`--timeout` and `--max-output-bytes`. Exceeding either limit fails without partial output.
+The direct child is reaped. POSIX cancellation kills its process group; Windows uses hidden
+processes and best-effort tree termination while the direct child exists. Already detached
+descendants are outside this ownership guarantee. Match the host's `session_id` if using the same mappings
 for hooks. `init` does not automatically rewrite shell commands: doing so changes permission
 matching and shell behavior and needs a separate host-specific validation.
 
@@ -184,10 +188,18 @@ are hashes of host conversation IDs, preventing path traversal.
 
 Mappings expire after one hour idle. An expired session is refused, not silently reallocated:
 old placeholders must not acquire new meanings. Start a new conversation to get a new host ID.
-Clean up orphan snapshots after a host crash; disk expiry is validated on access rather than
-by a background daemon. A crashed transaction may leave a `.lock` file: remove it only after
-confirming no writer is active. Removal retains state so an ongoing conversation can still be
+Disk expiry is validated on access rather than by a background daemon. Native OS locks release
+on process exit, while marked `.lock` files remain and must be retained. Legacy empty locks
+require migration after confirming no old writer is active. Removal retains state so a conversation can still be
 restored manually. Delete the state directory after all conversations are finished if desired.
+
+Use `secure-mcp state status [--agent codex]` to inspect aggregate snapshot states without
+original IDs, mappings, passwords, or paths. `state gc` previews expired ciphertext retirement;
+`state gc --apply` revalidates expiry under the transaction lock. It preserves valid, corrupt,
+unknown, active, and legacy-locked files, and never deletes persistent locks. A durable retired
+marker prevents old host IDs from allocating new meanings for old aliases. Start a new host
+conversation after retirement; no automatic alias reuse occurs. Custom directories use
+`--state-dir`; Codex remains scoped to its own subdirectory.
 
 The key and snapshots are protected by the local OS account. POSIX creation requests private
 permissions; Windows uses inherited ACLs, which must be suitable for private user files.

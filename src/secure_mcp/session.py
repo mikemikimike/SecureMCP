@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import math
 import re
 from threading import TIMEOUT_MAX, Event, RLock, Thread
@@ -116,8 +117,11 @@ class PrivacySession:
         strategy: SurrogateStrategy = SurrogateStrategy.BRACKET,
         ttl_seconds: float = 3600,
         salt: str = "",
+        mapping_limit: int = 100_000,
     ):
         validate_ttl(ttl_seconds)
+        if type(mapping_limit) is not int or mapping_limit < 1:
+            raise ValueError("mapping_limit must be a positive integer.")
         self.session_id = session_id
         self.mode = mode
         self.strategy = strategy
@@ -125,12 +129,28 @@ class PrivacySession:
         self.created_at = self.last_accessed = time.time()
         self.total_mask_calls = self.total_unmask_calls = 0
         self.generator = StrategyGenerator(strategy=strategy, salt=salt)
+        self.generator.max_mappings = mapping_limit
+        self.active_pins = 0
         self.forward_store = SessionMappings(self.generator)
         self.reverse_store = SessionMappings(self.generator)
 
     def operation(self):
         """Use this context for counters, settings, and custom store mutations."""
         return self.generator.operation()
+
+    @contextmanager
+    def pin(self):
+        """Keep a provider request alive without holding its mapping lock."""
+        with self.operation():
+            self.active_pins += 1
+            self.last_accessed = time.time()
+        try:
+            yield self
+        finally:
+            with self.generator.lock:
+                self.active_pins -= 1
+                if not self.generator.closed:
+                    self.last_accessed = time.time()
 
     def is_expired(self) -> bool:
         with self.generator.lock:
@@ -172,9 +192,15 @@ class SessionVault:
     """Registry is locked; built-in engine operations share each session's RLock."""
 
     def __init__(
-        self, default_ttl: float = 3600, cleanup_interval: float | None = None
+        self, default_ttl: float = 3600, cleanup_interval: float | None = None,
+        max_sessions: int = 1000, mapping_limit: int = 100_000,
     ):
         validate_ttl(default_ttl)
+        for name, value in (("max_sessions", max_sessions), ("mapping_limit", mapping_limit)):
+            if type(value) is not int or value < 1:
+                raise ValueError(f"{name} must be a positive integer.")
+        self.max_sessions = max_sessions
+        self.mapping_limit = mapping_limit
         self.default_ttl = default_ttl
         self.default_session_id = f"sess_{uuid.uuid4().hex}"
         self._sessions: dict[str, PrivacySession] = {}
@@ -228,13 +254,17 @@ class SessionVault:
         mode: MaskMode = MaskMode.CONTENT_WORDS,
         strategy: SurrogateStrategy = SurrogateStrategy.BRACKET,
     ) -> PrivacySession:
-        with self._lock:
-            if self._closed:
-                raise ValueError("Session vault is closed.")
-            self._cleanup_expired_locked()
-            sid = self._sid(session_id)
-            if sid in self._sessions:
-                session = self._sessions[sid]
+        while True:
+            with self._lock:
+                if self._closed:
+                    raise ValueError("Session vault is closed.")
+                self._cleanup_expired_locked()
+                sid = self._sid(session_id)
+                session = self._sessions.get(sid)
+                if session is None:
+                    return self.create(sid, mode, strategy, self.default_ttl)
+            # Waiting for one session must not stall unrelated registry users.
+            try:
                 with session.operation():
                     if session.strategy != strategy:
                         raise ValueError(
@@ -244,7 +274,10 @@ class SessionVault:
                     session.mode = mode
                     session.touch()
                     return session
-            return self.create(sid, mode, strategy, self.default_ttl)
+            except ValueError:
+                if not session.generator.closed:
+                    raise
+                # A concurrent clear invalidated this generation before entry.
 
     def create(
         self,
@@ -264,7 +297,9 @@ class SessionVault:
                 raise ValueError(
                     f"Session '{sid}' already exists. Use a new ID or clear it first."
                 )
-            session = PrivacySession(sid, mode, strategy, ttl)
+            if len(self._sessions) >= self.max_sessions:
+                raise ValueError("Session limit reached; clear an idle session before creating another.")
+            session = PrivacySession(sid, mode, strategy, ttl, mapping_limit=self.mapping_limit)
             self._sessions[sid] = session
             self._start_cleanup_locked()
             return session
@@ -273,9 +308,14 @@ class SessionVault:
         with self._lock:
             self._cleanup_expired_locked()
             session = self._sessions.get(self._sid(session_id))
-            if session:
+        if session:
+            try:
                 session.touch()
-            return session
+            except ValueError:
+                if session.generator.closed:
+                    return None
+                raise
+        return session
 
     @property
     def active_count(self) -> int:
@@ -286,10 +326,10 @@ class SessionVault:
     def clear_session(self, session_id: str) -> bool:
         with self._lock:
             session = self._sessions.pop(self._sid(session_id), None)
-            if session:
-                session.clear()  # waits for any active mask/unmask before invalidation
-                return True
-            return False
+        if session:
+            session.clear()  # waits for this generation, outside the registry lock
+            return True
+        return False
 
     def clear_all(self) -> int:
         with self._lock:
@@ -310,7 +350,11 @@ class SessionVault:
     def _cleanup_expired_locked(self) -> None:
         for sid in list(self._sessions):
             session = self._sessions[sid]
-            with session.generator.lock:
-                if session.is_expired():
+            if not session.generator.lock.acquire(blocking=False):
+                continue
+            try:
+                if session.generator.closed or (not session.active_pins and session.is_expired()):
                     session.clear()
                     del self._sessions[sid]
+            finally:
+                session.generator.lock.release()

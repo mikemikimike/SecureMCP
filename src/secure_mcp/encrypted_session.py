@@ -102,7 +102,7 @@ def save_session(
             os.unlink(temporary)
 
 
-def load_session(path: Path, password: str, session_id: str) -> PrivacySession:
+def load_session(path: Path, password: str, session_id: str | None = None) -> PrivacySession:
     """Decrypt and validate a snapshot, rejecting expired or mismatched sessions."""
     data = path.read_bytes()
     if not data.startswith(_MAGIC) or len(data) <= len(_MAGIC) + _SALT_SIZE:
@@ -123,6 +123,8 @@ def load_session(path: Path, password: str, session_id: str) -> PrivacySession:
     if version not in (1, 2):
         raise ValueError(f"Unsupported encrypted session payload version: {version}")
     try:
+        if not isinstance(payload["session_id"], str) or not payload["session_id"]:
+            raise ValueError("Invalid session ID")
         session = PrivacySession(
             payload["session_id"],
             MaskMode(payload["mode"]),
@@ -184,7 +186,7 @@ def load_session(path: Path, password: str, session_id: str) -> PrivacySession:
         expired = session.is_expired()
     except (KeyError, TypeError, ValueError):
         raise ValueError("Invalid encrypted session payload.") from None
-    if session.session_id != session_id:
+    if session_id is not None and session.session_id != session_id:
         session.clear()
         raise ValueError("Session file belongs to a different session ID.")
     if expired:

@@ -37,6 +37,12 @@ def handle_admin(handler):
     if not handler.authorized():
         handler.send_body(401, b'{"error":"Unauthorized"}')
         return True
+    if url.path == "/admin/api/sessions":
+        if url.query:
+            handler.send_body(400, b'{"error":"Session diagnostics take no filters"}')
+        else:
+            handler.send_body(200, json.dumps(handler.server.session_diagnostics()).encode())
+        return True
     if url.path != "/admin/api/logs":
         handler.send_body(404, b'{"error":"Unknown admin endpoint"}')
         return True
@@ -48,7 +54,7 @@ def handle_admin(handler):
             raise ValueError("Query too large")
         # Python 3.10 rejects an empty query when strict_parsing is enabled.
         params = parse_qs(url.query, keep_blank_values=True, strict_parsing=True) if url.query else {}
-        allowed = {"agent", "provider", "subscription", "account_ref", "result",
+        allowed = {"agent", "provider", "subscription", "account_ref", "credential_ref", "result",
                    "since", "until", "limit", "offset"}
         if set(params) - allowed or any(len(v) != 1 for v in params.values()):
             raise ValueError("Invalid filters")

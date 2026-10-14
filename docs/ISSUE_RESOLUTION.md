@@ -96,3 +96,24 @@ coverage gate 85%, Ruff and mypy; optional native offline Claude/Codex/Grok scen
 calls were not enabled. GitHub cross-platform results are reported separately in issue
 comments after pushing. The #86 design review retains buffering and includes measured
 performance/memory evidence; it does not claim incremental streaming was implemented.
+# Release 0.6.0 review follow-up
+
+The following open issues were rechecked against the released code and addressed together.
+Earlier release notes and parser fixtures remain historical records.
+
+| Issues | Resolution and proof |
+| --- | --- |
+| #105, #107, #108, #128 | Public safety/tool-choice/context tags validated in their protocol positions; custom grammar envelopes pinned completely. `test_batch_gateway` |
+| #106, #122, #123, #138–#142 | Language-specific C keywords, JS regex/templates, Python soft keywords/PEP 701, Go/SQL escapes, Rust lifetimes/nested comments. `test_batch_parser` |
+| #109 | Already fixed with byte-based constant-time token comparison; non-ASCII regression remains covered by admin tests. |
+| #110, #111, #113, #135, #137 | Strict Korean alias detection, relevant mapping lookup, request pinning, nonblocking cleanup, private numeric tails. `test_batch_core` |
+| #112, #117, #120, #129–#134, #143–#145, #151, #152 | Safe shutdown/admission, aggregate diagnostics, upstream errors, schema/ref and streaming/numeric restoration. `test_batch_gateway`, `test_batch_interfaces` |
+| #114, #124, #125 | Current SDK/lock documentation, compatible asyncio minimum, wheel/sdist CI smoke outside source. `scripts/package_smoke.py` |
+| #115, #116, #118, #126, #146, #149 | UTF-8 CLI input, configurable resource budgets, safe snapshot retirement, bounded binary command capture, Windows hook paths. `test_batch_core`, `test_batch_hooks`, `test_batch_exec_capture`, `test_batch_interfaces` |
+| #119, #153 | SDK retry/rate headers and anonymous credential filtering through API/UI. `test_batch_interfaces` |
+| #121, #127, #136, #147, #148, #150 | Ownership checks, exact Orca synchronized hashes, redirect rejection, validated settings, durable install recovery, completed stop. `test_batch_install`, `test_batch_antigravity_install` |
+
+Character literals (#130) use opaque identifier expressions rather than invalid multi-character
+quoted placeholders. Masked code remains a review representation, not executable anonymization.
+Unsupported string schema constraints fail before forwarding. Hook GC retires old host IDs rather
+than reallocating their aliases, and persistent OS lock files are preserved.

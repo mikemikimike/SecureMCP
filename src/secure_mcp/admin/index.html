@@ -44,6 +44,7 @@
           <label>결과<select name="result"><option value="">모든 결과</option><option value="success">성공</option><option value="error">실패</option><option value="incomplete">진행 중 / 미완료</option></select></label>
           <label>시작 일시<input name="since" type="datetime-local"></label>
           <label>계정 ID<input name="account_ref" placeholder="익명 계정 ID" maxlength="16"></label>
+          <label>자격 증명 ID<input name="credential_ref" placeholder="익명 자격 증명 ID" maxlength="16"></label>
           <button type="reset" class="quiet reset">초기화</button>
         </form>
         <div class="table-scroll"><table><thead><tr><th>처리 일시</th><th>에이전트 / 모델</th><th>제공자 / 구독</th><th>익명 계정</th><th>결과</th><th>소요 시간</th><th><span class="sr-only">상세</span></th></tr></thead><tbody id="rows"></tbody></table></div>

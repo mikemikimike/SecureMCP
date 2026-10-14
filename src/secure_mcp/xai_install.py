@@ -12,6 +12,7 @@ from secure_mcp.gateway_install import (
     apply_settings,
     load_config,
     load_installation_manifest,
+    _recover_install,
 )
 
 
@@ -39,6 +40,7 @@ def install_api(path: Path, model: str, port=38118, grok_dir=None):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.parent.chmod(0o700)
     with session_file_lock(path):
+        _recover_install(path)
         config = (
             load_api_config(path)
             if path.exists()

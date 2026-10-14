@@ -7,7 +7,6 @@ from pathlib import Path
 import json
 import os
 import sqlite3
-import subprocess
 import sys
 import time
 
@@ -51,6 +50,27 @@ def _file_options(command):
     )(command)
 
 
+def _text_input(text, input_file):
+    if text is not None and input_file is not None:
+        raise click.UsageError("Choose text, --input-file, or stdin, not multiple inputs.")
+    if text is not None:
+        return text
+    try:
+        if input_file is not None:
+            with input_file.open("rb") as stream:
+                raw = stream.read(engine.max_input_bytes + 1)
+        else:
+            if sys.stdin.isatty():
+                raise click.UsageError("Provide text, --input-file, or UTF-8 stdin.")
+            raw = (sys.stdin.buffer.read(engine.max_input_bytes + 1)
+                   if hasattr(sys.stdin, "buffer") else sys.stdin.read().encode("utf-8"))
+        if len(raw) > engine.max_input_bytes:
+            raise click.ClickException("Input size limit reached.")
+        return raw.decode("utf-8")
+    except UnicodeError:
+        raise click.ClickException("Input must be valid UTF-8.") from None
+    except OSError:
+        raise click.ClickException("Could not read the input file.") from None
 def _check_strategy(session, strategy):
     if session.strategy != strategy:
         raise ValueError(
@@ -105,9 +125,18 @@ def main():
 
 @main.command()
 @click.option("--transport", type=click.Choice(["stdio"]), default="stdio")
-def serve(transport):
+@click.option("--max-sessions", type=click.IntRange(1), default=1000,
+              envvar="SECURE_MCP_MAX_SESSIONS")
+@click.option("--mapping-limit", type=click.IntRange(1), default=100_000,
+              envvar="SECURE_MCP_MAPPING_LIMIT")
+@click.option("--input-limit", type=click.IntRange(1), default=16 * 1024 * 1024,
+              envvar="SECURE_MCP_INPUT_LIMIT")
+def serve(transport, max_sessions, mapping_limit, input_limit):
     """Run local MCP utilities. Network transports are disabled without authentication."""
     try:
+        vault.max_sessions = max_sessions
+        vault.mapping_limit = mapping_limit
+        engine.max_input_bytes = input_limit
         app.run(transport=transport)
     finally:
         vault.close()
@@ -235,6 +264,29 @@ def stats(agent, state_dir, session_id):
         raise click.ClickException(str(exc)) from None
 
 
+@main.group("state")
+def state():
+    """Inspect local encrypted Hook snapshots and retire expired conversations."""
+
+
+@state.command("status")
+@click.option("--agent", type=click.Choice(["claude", "codex"]), default="claude")
+@click.option("--state-dir", type=click.Path(path_type=Path), default=default_state_dir)
+def state_status(agent, state_dir):
+    from secure_mcp.hooks import HookStore
+    click.echo(json.dumps(HookStore(agent_state_dir(state_dir, agent)).snapshot_diagnostics()))
+
+
+@state.command("gc")
+@click.option("--agent", type=click.Choice(["claude", "codex"]), default="claude")
+@click.option("--state-dir", type=click.Path(path_type=Path), default=default_state_dir)
+@click.option("--apply", "apply_cleanup", is_flag=True,
+              help="Retire expired snapshots; default is a read-only preview.")
+def state_gc(agent, state_dir, apply_cleanup):
+    from secure_mcp.hooks import HookStore
+    click.echo(json.dumps(HookStore(agent_state_dir(state_dir, agent)).gc(dry_run=not apply_cleanup)))
+
+
 @main.command(hidden=True)
 @click.option("--agent", type=click.Choice(["claude", "codex"]), default="claude")
 @click.option("--state-dir", type=click.Path(path_type=Path), required=True)
@@ -288,20 +340,23 @@ def hook(agent, state_dir):
 @click.option("--agent", type=click.Choice(["claude", "codex"]), default="claude")
 @click.option("--state-dir", type=click.Path(path_type=Path), default=default_state_dir)
 @click.option("--session-id", required=True)
+@click.option("--timeout", type=click.FloatRange(min=0.01), default=180.0)
+@click.option("--max-output-bytes", type=click.IntRange(1), default=16 * 1024 * 1024)
 @click.argument("command", nargs=-1, type=click.UNPROCESSED, required=True)
-def exec_masked(agent, state_dir, session_id, command):
+def exec_masked(agent, state_dir, session_id, timeout, max_output_bytes, command):
     """Run executable + arguments locally; return only masked stdout/stderr (no implicit shell)."""
     from secure_mcp.hooks import HookStore
+    from secure_mcp.command_capture import capture_command
 
     store = HookStore(agent_state_dir(state_dir, agent))
     try:
         with store.session(session_id) as session:
             restored = [store.restore(arg, session) for arg in command]
-        completed = subprocess.run(restored, capture_output=True, encoding="utf-8")
+        completed = capture_command(restored, timeout=timeout, max_output_bytes=max_output_bytes)
         with store.session(session_id, create=True) as session:
             assert session is not None
-            stdout = store.mask(completed.stdout, session)
-            stderr = store.mask(completed.stderr, session)
+            stdout = store.mask(completed.stdout.decode("utf-8"), session)
+            stderr = store.mask(completed.stderr.decode("utf-8"), session)
     except (ValueError, OSError, AssertionError):
         raise click.ClickException(
             "Local execution/masking failed; no raw output was returned."
@@ -338,7 +393,8 @@ def restore_hook_text(agent, state_dir, session_id):
 
 
 @main.command()
-@click.argument("text")
+@click.argument("text", required=False)
+@click.option("--input-file", type=click.Path(dir_okay=False, path_type=Path))
 @click.option("--session-id", default="cli_session")
 @click.option(
     "--mode", type=click.Choice([m.value for m in MaskMode]), default="content_words"
@@ -356,6 +412,7 @@ def restore_hook_text(agent, state_dir, session_id):
 @_file_options
 def mask(
     text,
+    input_file,
     session_id,
     mode,
     strategy,
@@ -368,6 +425,7 @@ def mask(
     session_password,
 ):
     """Mask locally; --json-output emits the masked payload without displaying raw input."""
+    text = _text_input(text, input_file)
     mask_mode, strat = MaskMode(mode), SurrogateStrategy(strategy)
     with _session(
         session_id, session_file, session_password, mask_mode, strat
@@ -395,7 +453,8 @@ def mask(
 
 
 @main.command()
-@click.argument("masked_text")
+@click.argument("masked_text", required=False)
+@click.option("--input-file", type=click.Path(dir_okay=False, path_type=Path))
 @click.option("--session-id", default="cli_session")
 @click.option(
     "--strategy", type=click.Choice([s.value for s in SurrogateStrategy]), default=None
@@ -410,6 +469,7 @@ def mask(
 @_file_options
 def unmask(
     masked_text,
+    input_file,
     session_id,
     strategy,
     normalize_particles,
@@ -419,6 +479,7 @@ def unmask(
     session_password,
 ):
     """Restore for local display. Never send this output back into the model context."""
+    masked_text = _text_input(masked_text, input_file)
     strat = SurrogateStrategy(strategy) if strategy is not None else None
     with _session(
         session_id, session_file, session_password, strategy=strat
@@ -575,6 +636,8 @@ def gateway_run(config, mapping_limit):
             state_dir=state,
             audit_path=state.parent / "logs.sqlite3",
             mapping_limit=mapping_limit or settings.get("mapping_limit", 100_000),
+            max_active_requests=settings.get("max_active_requests", 32),
+            max_provider_requests=settings.get("max_provider_requests", 8),
         ) as server:
             server.serve_forever()
     except (ValueError, OSError, sqlite3.Error) as exc:
@@ -679,6 +742,27 @@ def gateway_reset(config, agent):
     click.echo("Mappings cleared. Start a new conversation before continuing.")
 
 
+@gateway.command("diagnostics")
+@click.option("--config", type=click.Path(path_type=Path))
+def gateway_diagnostics(config):
+    """Show authenticated aggregate usage and lifetimes without private mappings."""
+    import urllib.request
+    from secure_mcp.gateway_install import default_config, load_config
+    from secure_mcp.gateway import NoRedirect
+    try:
+        settings = load_config(config or default_config())
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{settings['port']}/admin/api/sessions",
+            headers={"X-SecureMCP-Token": settings["token"]},
+        )
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+        with opener.open(request, timeout=5) as response:
+            result = json.loads(response.read(64 * 1024))
+    except (ValueError, OSError):
+        raise click.ClickException("Gateway diagnostics unavailable.") from None
+    click.echo(json.dumps(result))
+
+
 @gateway.command("stop")
 @click.option("--config", type=click.Path(path_type=Path))
 def gateway_stop(config):
@@ -730,6 +814,8 @@ def gateway_api_run(config):
             upstreams={},
             api_upstreams={"xai": API_UPSTREAMS["xai"]},
             mapping_limit=settings.get("mapping_limit", 100_000),
+            max_active_requests=settings.get("max_active_requests", 32),
+            max_provider_requests=settings.get("max_provider_requests", 8),
             state_dir=path.resolve().parent / "sessions",
             audit_path=path.resolve().parent / "logs.sqlite3",
         ) as server:

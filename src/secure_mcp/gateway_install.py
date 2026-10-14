@@ -21,7 +21,71 @@ import urllib.request
 import tomlkit
 
 from secure_mcp.encrypted_session import session_file_lock
-from secure_mcp.hooks import _atomic_json, _remove_owned
+from secure_mcp.hooks import _atomic_json, _remove_owned, _settings
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *_args, **_kwargs):
+        return None
+
+
+def _installed(record, data):
+    return data is not None and sha256(data).hexdigest() in {
+        record["installed_sha256"],
+        *record.get("accepted_sha256", []),
+    }
+
+
+def _recover_install(path):
+    """Roll an interrupted prepare/apply transaction back without losing edits."""
+    journal = path.parent / "installation.pending.json"
+    if not journal.exists():
+        return
+    try:
+        value = json.loads(journal.read_bytes())
+        records = value["files"]
+        if not isinstance(records, dict):
+            raise ValueError()
+        originals = {}
+        for name, record in records.items():
+            target = Path(name)
+            if not target.is_absolute() or not isinstance(record, dict):
+                raise ValueError()
+            if not isinstance(record.get("after_sha256"), str) or not re.fullmatch(
+                r"[0-9a-f]{64}", record["after_sha256"]
+            ):
+                raise ValueError()
+            if record.get("before_hex") is not None and not isinstance(
+                record["before_hex"], str
+            ):
+                raise ValueError()
+            original = (
+                bytes.fromhex(record["before_hex"])
+                if record["before_hex"] is not None
+                else None
+            )
+            current = target.read_bytes() if target.is_file() else None
+            if (target.exists() and not target.is_file()) or (
+                current != original
+                and (
+                    current is None
+                    or sha256(current).hexdigest() != record["after_sha256"]
+                )
+            ):
+                raise ValueError()
+            originals[target] = original
+    except (ValueError, KeyError, TypeError):
+        raise ValueError(
+            "Interrupted installation settings changed; merge installation.pending.json before retrying."
+        ) from None
+    # Validate all files before restoring any. Retain journal until every restore
+    # succeeds, so recovery itself can be interrupted and safely retried.
+    for target, original in originals.items():
+        if original is None:
+            target.unlink(missing_ok=True)
+        else:
+            atomic_bytes(target, original)
+    journal.unlink()
 
 
 def default_config() -> Path:
@@ -74,6 +138,7 @@ def _parse_installation_manifest(data):
             raise ValueError(message)
         original = record.get("original_hex")
         digest = record.get("installed_sha256")
+        accepted = record.get("accepted_sha256", [])
         if (
             "original_hex" not in record
             or original is not None
@@ -84,6 +149,11 @@ def _parse_installation_manifest(data):
             )
             or not isinstance(digest, str)
             or not re.fullmatch(r"[0-9a-f]{64}", digest)
+            or not isinstance(accepted, list)
+            or any(
+                not isinstance(item, str) or not re.fullmatch(r"[0-9a-f]{64}", item)
+                for item in accepted
+            )
         ):
             raise ValueError(message)
     return manifest
@@ -100,14 +170,17 @@ def _healthy_response(config):
         headers={"X-SecureMCP-Token": config["token"]},
     )
     try:
-        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(
-            request, timeout=1
-        ) as response:
+        with urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), _NoRedirect()
+        ).open(request, timeout=1) as response:
             value = json.load(response)
             return (
                 isinstance(value, dict)
                 and value.get("service") == "secure-mcp-subscription-gateway"
             )
+    except urllib.error.HTTPError as exc:
+        exc.close()
+        return False
     except (OSError, ValueError, HTTPException):
         return False
 
@@ -190,24 +263,23 @@ def stop_gateway(path: Path):
         headers={"X-SecureMCP-Token": config["token"]},
     )
     try:
-        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(
-            request, timeout=5
-        ) as response:
+        with urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), _NoRedirect()
+        ).open(request, timeout=5) as response:
             response.read()
     except urllib.error.HTTPError as exc:
         # An authenticated HTTP rejection is never a successful shutdown.
         exc.close()
         raise
-    except (HTTPException, OSError) as exc:
+    except (HTTPException, OSError):
         # The daemon can close its socket while acknowledging shutdown. Confirm
         # that it actually disappeared rather than hiding a failed stop request.
-        deadline = time.monotonic() + 2
-        while _healthy_response(config):
-            if time.monotonic() >= deadline:
-                raise OSError(
-                    "Gateway remained active after an interrupted shutdown response."
-                ) from exc
-            time.sleep(0.05)
+        pass
+    deadline = time.monotonic() + 5
+    while healthy(config):
+        if time.monotonic() >= deadline:
+            raise OSError("Gateway remained active after the shutdown request.")
+        time.sleep(0.05)
     return True
 
 
@@ -235,9 +307,9 @@ def changed_installation_files(path: Path) -> list[str] | None:
         return None
     manifest = load_installation_manifest(manifest_path)
     return [
-        name for name, record in manifest["files"].items()
-        if not Path(name).is_file()
-        or sha256(Path(name).read_bytes()).hexdigest() != record["installed_sha256"]
+        name
+        for name, record in manifest["files"].items()
+        if not Path(name).is_file() or not _installed(record, Path(name).read_bytes())
     ]
 
 
@@ -255,6 +327,7 @@ def install_gateway(
         load_installation_manifest(manifest_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with session_file_lock(path):
+        _recover_install(path)
         return _install_gateway(path, agent, port, claude_dir, codex_dir, startup_path)
 
 
@@ -349,11 +422,13 @@ def _install_gateway(path: Path, agent, port, claude_dir, codex_dir, startup_pat
             claude_dir
             or Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
         ) / "settings.json"
-        value = (
-            json.loads(settings.read_text(encoding="utf-8"))
-            if settings.exists()
-            else {}
-        )
+        value = _settings(settings)
+        if not isinstance(value.get("env", {}), dict) or not isinstance(
+            value.get("env", {}).get("ANTHROPIC_CUSTOM_HEADERS", ""), str
+        ):
+            raise ValueError(
+                "Invalid Claude environment settings; no settings were overwritten."
+            )
         env = value.setdefault("env", {})
         if (
             env.get("ANTHROPIC_AUTH_TOKEN")
@@ -377,7 +452,8 @@ def _install_gateway(path: Path, agent, port, claude_dir, codex_dir, startup_pat
         changes[settings] = (
             json.dumps(value, ensure_ascii=False, indent=2) + "\n"
         ).encode()
-    for home in codex_settings_homes(codex_dir) if agent in {"codex", "both"} else []:
+    homes = codex_settings_homes(codex_dir) if agent in {"codex", "both"} else []
+    for home in homes:
         settings = home / "config.toml"
         value = (
             tomlkit.parse(settings.read_text(encoding="utf-8"))
@@ -396,12 +472,16 @@ def _install_gateway(path: Path, agent, port, claude_dir, codex_dir, startup_pat
             "http_headers": {"X-SecureMCP-Token": config["token"]},
         }
         changes[settings] = tomlkit.dumps(value).encode()
-    return apply_settings(path, config, changes)
+    mirrors = (
+        {homes[1] / "config.toml": homes[0] / "config.toml"} if len(homes) == 2 else {}
+    )
+    return apply_settings(path, config, changes, mirrors=mirrors)
 
 
-def apply_settings(path: Path, config, changes):
+def apply_settings(path: Path, config, changes, *, mirrors=None):
     """Back up and transactionally apply settings, shared by subscription/API setup."""
     manifest_path = path.parent / "installation.json"
+    _recover_install(path)
     previous_config = path.read_bytes() if path.exists() else None
     previous_manifest = manifest_path.read_bytes() if manifest_path.exists() else None
     manifest = (
@@ -417,10 +497,8 @@ def apply_settings(path: Path, config, changes):
     for settings, data in changes.items():
         name = str(settings.resolve())
         record = manifest["files"].get(name)
-        if (
-            record
-            and settings.exists()
-            and sha256(settings.read_bytes()).hexdigest() != record["installed_sha256"]
+        if record and (
+            not settings.is_file() or not _installed(record, settings.read_bytes())
         ):
             raise ValueError(
                 "Host settings changed after setup; uninstall/merge them before reinstalling."
@@ -433,11 +511,33 @@ def apply_settings(path: Path, config, changes):
             }
             manifest["files"][name] = record
         record["installed_sha256"] = sha256(data).hexdigest()
+        record.pop("accepted_sha256", None)
+        if mirrors and settings in mirrors:
+            record["accepted_sha256"] = [sha256(changes[mirrors[settings]]).hexdigest()]
     originals = {
         settings: settings.read_bytes() if settings.exists() else None
         for settings in changes
     }
     applied = []
+    journal_path = path.parent / "installation.pending.json"
+    pending = {
+        str(settings.resolve()): {
+            "before_hex": original.hex() if original is not None else None,
+            "after_sha256": sha256(changes[settings]).hexdigest(),
+        }
+        for settings, original in originals.items()
+    }
+    config_data = (json.dumps(config, ensure_ascii=False, indent=2) + "\n").encode()
+    manifest_data = (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode()
+    for target, previous, data in [
+        (path, previous_config, config_data),
+        (manifest_path, previous_manifest, manifest_data),
+    ]:
+        pending[str(target.resolve())] = {
+            "before_hex": previous.hex() if previous is not None else None,
+            "after_sha256": sha256(data).hexdigest(),
+        }
+    _atomic_json(journal_path, {"files": pending})
     try:
         _atomic_json(path, config)
         path.chmod(0o600)
@@ -447,6 +547,7 @@ def apply_settings(path: Path, config, changes):
             atomic_bytes(settings, data)
             applied.append(settings)
             settings.chmod(0o600)
+        journal_path.unlink()
     except OSError:
         for settings in reversed(applied):
             original = originals[settings]
@@ -462,6 +563,7 @@ def apply_settings(path: Path, config, changes):
             path.unlink(missing_ok=True)
         else:
             atomic_bytes(path, previous_config)
+        journal_path.unlink(missing_ok=True)
         raise
     return list(changes)
 
@@ -474,6 +576,7 @@ def uninstall_gateway(path: Path):
     if manifest_path.exists():
         load_installation_manifest(manifest_path)
     with session_file_lock(path):
+        _recover_install(path)
         return _uninstall_gateway(path)
 
 
@@ -493,10 +596,7 @@ def _uninstall_gateway(path: Path):
         )
         originals[settings] = original
         current = settings.read_bytes() if settings.is_file() else None
-        installed = (
-            current is not None
-            and sha256(current).hexdigest() == record["installed_sha256"]
-        )
+        installed = _installed(record, current)
         restored = (
             recovering
             and current == original

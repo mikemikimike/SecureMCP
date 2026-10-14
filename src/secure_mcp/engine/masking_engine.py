@@ -52,11 +52,18 @@ NUMERIC_ALIAS_RUN = re.compile(r"(?<![A-Za-z0-9_])(?:732846\d{12})+(?![A-Za-z0-9
 
 
 class MaskingEngine:
-    def __init__(self) -> None:
+    def __init__(self, max_input_bytes: int = 16 * 1024 * 1024) -> None:
+        if type(max_input_bytes) is not int or max_input_bytes < 1:
+            raise ValueError("max_input_bytes must be a positive integer.")
+        self.max_input_bytes = max_input_bytes
         self.en_grammar = EnglishGrammarEngine()
         self.ko_grammar = KoreanGrammarEngine()
         self.code_parser = CodeParser()
         self.tokenizer = MultilingualTokenizer()
+
+    def _check_input(self, text: str) -> None:
+        if len(text.encode("utf-8")) > self.max_input_bytes:
+            raise ValueError("Input size limit reached; split the input into smaller requests.")
 
     @staticmethod
     def _strategy(
@@ -81,6 +88,7 @@ class MaskingEngine:
         code_language: str = "auto",
     ) -> MaskResult:
         strategy = self._strategy(generator, strategy)
+        self._check_input(text)
         if language not in {"auto", "en", "ko"}:
             raise ValueError("language must be auto, en, or ko")
         with generator.operation():
@@ -97,6 +105,10 @@ class MaskingEngine:
             terms = sensitive_terms or set()
             preserve = {word.casefold() for word in (custom_preserve or set())}
             chunks = self._chunks(text, terms)
+            if hasattr(mapping_store, "originals_in"):
+                known = terms | mapping_store.originals_in(text)
+            else:
+                known = terms | {m.original for m in mapping_store.values()}
             output: list[str] = []
             total = masked = 0
             for chunk in chunks:
@@ -124,7 +136,6 @@ class MaskingEngine:
                     token_type, should_mask = TokenType.NUMBER, True
                 elif not force and is_hangul_string(word):
                     # Mixed Korean/English input is handled per token, even with language=en.
-                    known = terms | {m.original for m in mapping_store.values()}
                     stem, suffix, token_type = self.ko_grammar.decompose_token(
                         word, known
                     )
@@ -224,6 +235,7 @@ class MaskingEngine:
         language: str = "auto",
     ) -> MaskResult:
         strategy = self._strategy(generator, strategy)
+        self._check_input(code)
         language = detect_language(code, language)
         with generator.operation():
             tokens = self.code_parser.tokenize(code, language)
@@ -239,6 +251,13 @@ class MaskingEngine:
                 total += 1
                 if token_type == TokenType.GRAMMAR:
                     output.append(raw)
+                elif subkind == "character":
+                    # A whole character literal is an opaque identifier expression.
+                    # Multi-character aliases inside character quotes are invalid.
+                    output.append(self._get_or_create_surrogate(
+                        raw, token_type, generator, mapping_store, reverse_store, code=True
+                    ))
+                    masked += 1
                 elif token_type == TokenType.LITERAL:
                     prefix, suffix = literal_parts(raw, subkind)
                     end = len(raw) - len(suffix) if suffix else len(raw)
@@ -401,6 +420,8 @@ class MaskingEngine:
             if key in mapping_store:
                 mapping_store[key].occurrence_count += 1
                 return mapping_store[key].surrogate
+            if len(mapping_store) >= generator.max_mappings:
+                raise ValueError("Mapping limit reached; clear the session or use a new one.")
             surrogate = generator.generate(token_type, original_token, code=code)
             mapping = TokenMapping(
                 original=original_token,

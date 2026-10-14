@@ -11,6 +11,7 @@ from copy import deepcopy
 from hashlib import sha256
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import math
 import http.client
 from pathlib import Path
 import re
@@ -18,7 +19,7 @@ import secrets
 import socket
 import sqlite3
 import time
-from threading import RLock
+from threading import Condition, RLock
 from typing import Any
 import urllib.error
 import urllib.request
@@ -600,13 +601,32 @@ class GatewaySession:
                 )
                 for key, item in value.items()
             }
+        if restore and type(value) in {int, float}:
+            # Source aliases are integers, even when the source literal was a
+            # decimal. Never recover an alias after floating-point rounding.
+            candidate = str(abs(value))
+            if type(value) is float and 732846000000000000 <= abs(value) < 732847000000000000:
+                raise ValueError("Numeric alias lost integer precision.")
+            mapping = self.session.reverse_store.get(candidate)
+            if mapping is not None and mapping.token_type == TokenType.NUMBER:
+                if not re.fullmatch(r"-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?", mapping.original):
+                    raise ValueError("Source literal cannot be restored as a JSON number.")
+                original = json.loads(mapping.original)
+                if type(original) is float and not math.isfinite(original):
+                    raise ValueError("Source literal is not a finite JSON number.")
+                return -original if value < 0 else original
+            # Detect invented numeric aliases with the same strict policy used
+            # for strings, while leaving ordinary JSON scalars unchanged.
+            self.restore(str(value))
         return value
 
-    def walk(self, value, restore=False, code=False):
+    def walk(self, value, restore=False, code=False, schema_root=None):
+        if schema_root is None:
+            schema_root = value
         if isinstance(value, str):
             return self.restore(value) if restore else self.mask(value, code)
         if isinstance(value, list):
-            return [self.walk(item, restore, code) for item in value]
+            return [self.walk(item, restore, code, schema_root) for item in value]
         if not isinstance(value, dict):
             return value
         kind = value.get("type", "")
@@ -663,10 +683,20 @@ class GatewaySession:
             elif (
                 key == "format"
                 and kind == "custom"
-                and isinstance(item, dict)
-                and item.get("type") == "grammar"
             ):
+                if item == {"type": "text"}:
+                    result[key] = {"type": "text"}
+                    continue
+                if not isinstance(item, dict):
+                    raise ValueError("Unrecognized custom tool grammar format.")
                 definition = item.get("definition", "")
+                if (
+                    set(item) != {"type", "syntax", "definition"}
+                    or item.get("type") != "grammar"
+                    or item.get("syntax") != "lark"
+                    or not isinstance(definition, str)
+                ):
+                    raise ValueError("Unrecognized custom tool grammar format.")
                 normalized = definition.replace("\r\n", "\n").strip()
                 allowed = (
                     value.get("name") == "exec"
@@ -738,7 +768,7 @@ class GatewaySession:
                 item, (dict, bool)
             ):
                 self.validate_schema(item)
-                result[key] = self.walk(item, restore)
+                result[key] = self.walk(item, restore, schema_root=item)
             elif key in SCHEMA_NAME_KEYWORDS:
                 if not isinstance(item, dict):
                     raise ValueError("Schema name maps must be objects.")
@@ -753,7 +783,7 @@ class GatewaySession:
                         [self.schema_name(name, restore) for name in v]
                         if key in {"dependentRequired", "dependencies"}
                         and isinstance(v, list)
-                        else self.walk(v, restore)
+                        else self.walk(v, restore, schema_root=schema_root)
                     )
                     for k, v in item.items()
                 }
@@ -767,32 +797,7 @@ class GatewaySession:
                     for k in item
                 ]
             elif key == "$ref" and isinstance(item, str):
-                if item == "#":
-                    result[key] = item
-                    continue
-                if not item.startswith("#/"):
-                    raise ValueError("Remote schema references are unsupported.")
-                segments = item[2:].split("/")
-                transformed = []
-                previous = ""
-                for segment in segments:
-                    original = segment.replace("~1", "/").replace("~0", "~")
-                    decoded = original
-                    # Only names under properties/$defs/definitions were
-                    # aliased by walk(); schema keywords and array indexes
-                    # keep their spelling so the masked reference resolves.
-                    if (
-                        previous in SCHEMA_NAME_KEYWORDS
-                        and decoded not in ARGUMENT_KEYS
-                    ):
-                        decoded = (
-                            self.restore(decoded)
-                            if restore
-                            else self.mask(decoded, code=True)
-                        )
-                    transformed.append(decoded.replace("~", "~0").replace("/", "~1"))
-                    previous = original
-                result[key] = "#/" + "/".join(transformed)
+                result[key] = self.schema_reference(item, schema_root, restore)
             elif key in DATA_KEYWORDS:
                 # enum/const/default/examples hold arbitrary JSON data. Protocol
                 # and schema exceptions must not apply inside them, or private
@@ -803,8 +808,33 @@ class GatewaySession:
                     or "role" in value) and key not in {"content", "tool_calls"}:
                     result[key] = self.walk_data(item, restore)
                 else:
-                    result[key] = self.walk(item, restore, code)
+                    result[key] = self.walk(item, restore, code, schema_root)
         return result
+
+    def schema_reference(self, reference, root, restore=False):
+        if reference == "#":
+            return reference
+        if not reference.startswith("#") or re.search(r"%(?![0-9A-Fa-f]{2})", reference):
+            raise ValueError("Remote schema references or malformed pointers are unsupported.")
+        pointer = urllib.parse.unquote(reference[1:], errors="strict")
+        if not pointer.startswith("/"):
+            raise ValueError("Remote schema references and named anchors are unsupported.")
+        node = root
+        name_map = False
+        transformed = []
+        for segment in pointer[1:].split("/"):
+            if re.search(r"~(?![01])", segment):
+                raise ValueError("Malformed schema pointer.")
+            original = segment.replace("~1", "/").replace("~0", "~")
+            decoded = self.schema_name(original, restore) if name_map else original
+            transformed.append(decoded.replace("~", "~0").replace("/", "~1"))
+            next_name_map = not name_map and isinstance(node, dict) and original in SCHEMA_NAME_KEYWORDS
+            try:
+                node = node[int(original)] if isinstance(node, list) else node[original]
+            except (KeyError, IndexError, TypeError, ValueError):
+                raise ValueError("Schema reference does not resolve.") from None
+            name_map = next_name_map
+        return "#" + urllib.parse.quote("/" + "/".join(transformed), safe="/~$")
 
     def tool_output(self, value, restore=False):
         """Content blocks have public envelopes; their extra payloads are data."""
@@ -890,6 +920,8 @@ class GatewaySession:
             raise ValueError("Schema must be an object or boolean.")
         if schema.get("patternProperties") or "pattern" in schema:
             raise ValueError("JSON Schema pattern constraints are unsupported.")
+        if set(schema) & {"minLength", "maxLength", "format"}:
+            raise ValueError("JSON Schema string length/format constraints cannot preserve aliases.")
         for key, item in schema.items():
             if key in SCHEMA_NAME_KEYWORDS and key != "dependentRequired":
                 if not isinstance(item, dict):
@@ -900,6 +932,9 @@ class GatewaySession:
                     self.validate_schema(child)
             elif key in {
                 "items",
+                "additionalItems",
+                "unevaluatedItems",
+                "contentSchema",
                 "additionalProperties",
                 "unevaluatedProperties",
                 "contains",
@@ -940,29 +975,126 @@ class GatewaySession:
             for key, item in value.items()
         }
 
-    def safeguards(self, value):
-        """Keep safety-policy enums usable while anonymizing paths/rule operands."""
+    def safeguards(self, value, position="envelope"):
+        """Support the observed classifier envelope; reject unknown controls."""
         if isinstance(value, list):
-            return [self.safeguards(item) for item in value]
+            if position != "envelope" or any(not isinstance(item, dict) for item in value):
+                raise ValueError("Unsupported safety policy envelope.")
+            return [self.safeguards(item, position) for item in value]
         if not isinstance(value, dict):
-            return self.mask(value) if isinstance(value, str) else value
-        result = {}
+            raise ValueError("Unsupported safety policy envelope.")
+        fields = {
+            "envelope": {"type", "classifier_context"},
+            "context": {"permission_mode", "platform", "live_cwd", "rules"},
+            "rules": {"allow", "deny", "ask"},
+            "rule": {"rule", "source"},
+        }
+        enums = {
+            "type": {"dangerous_tool_use"},
+            "permission_mode": {"auto", "default", "acceptEdits", "plan", "dontAsk", "bypassPermissions"},
+            "platform": {"windows", "linux", "darwin"},
+            "source": {"toolsNarrowing", "userSettings", "projectSettings", "localSettings", "commandLine"},
+        }
+        if set(value) - fields[position]:
+            raise ValueError("Unsupported safety policy fields.")
+        result: dict[str, Any] = {}
         for key, item in value.items():
-            if key in {"type", "permission_mode", "platform", "source"}:
-                # Public classifier protocol tags; never arbitrary private content.
-                if not isinstance(item, str) or not re.fullmatch(r"[A-Za-z_]+", item):
+            if key in enums:
+                if not isinstance(item, str) or item not in enums[key]:
                     raise ValueError("Unsupported safety protocol tag.")
                 result[key] = item
-            elif key == "rule" and item in TOOL_NAMES:
-                result[key] = item
+            elif key == "classifier_context":
+                result[key] = self.safeguards(item, "context")
+            elif key == "rules":
+                result[key] = self.safeguards(item, "rules")
+            elif position == "rules":
+                if not isinstance(item, list):
+                    raise ValueError("Safety rules must be arrays.")
+                result[key] = [self.safeguards(rule, "rule") for rule in item]
+            elif key in {"rule", "live_cwd"}:
+                if not isinstance(item, str):
+                    raise ValueError("Safety operands must be text.")
+                result[key] = item if key == "rule" and item in TOOL_NAMES else self.mask(item)
             else:
-                result[key] = self.safeguards(item)
+                raise ValueError("Unsupported safety policy field.")
         return result
 
+    def tool_choice(self, value, dialect):
+        if isinstance(value, str):
+            if value not in {"auto", "none", "required", "any"}:
+                raise ValueError("Unsupported tool choice.")
+            return value
+        if not isinstance(value, dict):
+            raise ValueError("Tool choice must be text or an object.")
+        kind = value.get("type")
+        if dialect == "claude":
+            allowed = {"type", "disable_parallel_tool_use"} | ({"name"} if kind == "tool" else set())
+            if not isinstance(kind, str) or kind not in {"auto", "none", "any", "tool"} or set(value) - allowed:
+                raise ValueError("Unsupported Claude tool choice.")
+            if "disable_parallel_tool_use" in value and not isinstance(value["disable_parallel_tool_use"], bool):
+                raise ValueError("Invalid parallel tool choice control.")
+            result = deepcopy(value)
+            if kind == "tool":
+                if not isinstance(value.get("name"), str):
+                    raise ValueError("Tool choice requires a tool name.")
+                result["name"] = self.walk({"name": value["name"]})["name"]
+            return result
+        if kind != "function":
+            raise ValueError("Unsupported function tool choice.")
+        if dialect == "chat_completions":
+            if set(value) != {"type", "function"} or not isinstance(value["function"], dict) or set(value["function"]) != {"name"}:
+                raise ValueError("Invalid function tool choice.")
+            name = value["function"].get("name")
+        else:
+            if set(value) != {"type", "name"}:
+                raise ValueError("Invalid function tool choice.")
+            name = value.get("name")
+        if not isinstance(name, str):
+            raise ValueError("Tool choice requires a tool name.")
+        return self.walk(value)
+
+    def context_management(self, value):
+        if not isinstance(value, dict) or set(value) != {"edits"} or not isinstance(value["edits"], list):
+            raise ValueError("Unsupported context management.")
+        result = []
+        for edit in value["edits"]:
+            if not isinstance(edit, dict):
+                raise ValueError("Context edits must be objects.")
+            kind = edit.get("type")
+            if kind == "clear_tool_uses_20250919":
+                fields = {"type", "trigger", "keep", "clear_at_least", "exclude_tools", "clear_tool_inputs"}
+                thresholds = {"trigger": "input_tokens", "keep": "tool_uses", "clear_at_least": "input_tokens"}
+            elif kind == "clear_thinking_20251015":
+                fields = {"type", "keep"}
+                thresholds = {"keep": "thinking_turns"}
+            else:
+                raise ValueError("Unsupported context edit type.")
+            if set(edit) - fields:
+                raise ValueError("Unsupported context edit controls.")
+            transformed = deepcopy(edit)
+            for key, tag in thresholds.items():
+                if key not in edit:
+                    continue
+                item = edit[key]
+                if kind == "clear_thinking_20251015" and key == "keep" and item == "all":
+                    continue
+                if (not isinstance(item, dict) or set(item) != {"type", "value"}
+                    or item.get("type") != tag or type(item.get("value")) is not int
+                    or item["value"] < (1 if tag == "thinking_turns" else 0)):
+                    raise ValueError("Invalid context edit threshold.")
+            if "clear_tool_inputs" in edit and not isinstance(edit["clear_tool_inputs"], bool):
+                raise ValueError("Invalid clear tool inputs control.")
+            if "exclude_tools" in edit:
+                names = edit["exclude_tools"]
+                if not isinstance(names, list) or any(not isinstance(name, str) for name in names):
+                    raise ValueError("Tool exclusions must be tool names.")
+                transformed["exclude_tools"] = [self.walk({"name": name})["name"] for name in names]
+            result.append(transformed)
+        return {"edits": result}
+
     def request(self, payload: dict[str, Any], *, dialect=None) -> dict[str, Any]:
-        validate_request(
-            payload, dialect or ("claude" if "messages" in payload else "codex")
-        )
+        request_dialect = dialect or ("claude" if "messages" in payload else "codex")
+        validate_request(payload, request_dialect)
         fields = (
             TOP_FIELDS | {"max_completion_tokens", "stop", "stream_options", "reasoning_effort", "response_format"}
             if dialect == "chat_completions"
@@ -1027,12 +1159,15 @@ class GatewaySession:
             if key == "safeguards":
                 result[key] = self.safeguards(value)
                 continue
+            if key == "context_management":
+                if request_dialect != "claude":
+                    raise ValueError("Context editing requires the Claude dialect.")
+                result[key] = self.context_management(value)
+                continue
             if key in {"client_metadata", "metadata"}:
                 continue  # Optional diagnostics are not required for inference.
-            if key == "tool_choice" and isinstance(value, str):
-                if value not in {"auto", "none", "required", "any"}:
-                    raise ValueError("Unsupported tool choice.")
-                result[key] = value
+            if key == "tool_choice":
+                result[key] = self.tool_choice(value, request_dialect)
                 continue
             if key in {
                 "messages",
@@ -1116,11 +1251,15 @@ class GatewaySession:
 
     def response(self, body: bytes, content_type: str, *, dialect=None) -> bytes:
         if "text/event-stream" not in content_type:
+            payload = json.loads(body)
+            if not isinstance(payload, dict):
+                raise ValueError("Upstream response must be a JSON object.")
             return json.dumps(
-                self.walk(json.loads(body), restore=True), ensure_ascii=False
+                self.walk(payload, restore=True), ensure_ascii=False
             ).encode()
         events: list[tuple[list[str], dict[str, Any] | None]] = []
-        for frame in re.split(r"\r?\n\r?\n", body.decode("utf-8")):
+        stream = body.decode("utf-8-sig").replace("\r\n", "\n").replace("\r", "\n")
+        for frame in stream.split("\n\n"):
             # SSE line endings do not include Unicode separators inside JSON strings.
             lines = frame.replace("\r\n", "\n").split("\n")
             data = "\n".join(
@@ -1178,6 +1317,10 @@ class GatewaySession:
                 continue
             kind = event.get("type", "")
             delta = event.get("delta")
+            if kind == "content_block_start" and not isinstance(event.get("content_block"), dict):
+                raise ValueError("Invalid Claude content block.")
+            if kind == "content_block_delta" and not isinstance(delta, dict):
+                raise ValueError("Invalid Claude content delta.")
             if (
                 kind == "content_block_start"
                 and event.get("content_block", {}).get("type") == "thinking"
@@ -1191,6 +1334,8 @@ class GatewaySession:
                 block = thinking[event["index"]]
                 for field in ("thinking", "signature"):
                     if field in delta:
+                        if not isinstance(delta[field], str):
+                            raise ValueError("Invalid Claude thinking delta.")
                         block[field] = block.get(field, "") + delta[field]
             if kind == "content_block_delta" and isinstance(delta, dict):
                 field = (
@@ -1200,19 +1345,26 @@ class GatewaySession:
                 )
                 if field not in delta:
                     continue  # signed thinking is kept exactly as received
+                if not isinstance(delta[field], str):
+                    raise ValueError("Invalid Claude text/JSON delta.")
                 target = delta
                 key = (kind, event.get("index"), field)
             elif kind in {
                 "response.output_text.delta",
+                "response.refusal.delta",
+                "response.reasoning_summary_text.delta",
                 "response.function_call_arguments.delta",
                 "response.custom_tool_call_input.delta",
             }:
+                if not isinstance(delta, str):
+                    raise ValueError("Invalid Responses delta.")
                 target, field = event, "delta"
                 key = (
                     kind,
                     event.get("item_id"),
                     event.get("output_index"),
                     event.get("content_index"),
+                    event.get("summary_index"),
                 )
             else:
                 continue
@@ -1252,6 +1404,8 @@ class GatewaySession:
             elif event.get("type") not in {
                 "content_block_delta",
                 "response.output_text.delta",
+                "response.refusal.delta",
+                "response.reasoning_summary_text.delta",
                 "response.function_call_arguments.delta",
                 "response.custom_tool_call_input.delta",
             }:
@@ -1276,6 +1430,8 @@ class PrivacyGateway(ThreadingHTTPServer):
         api_upstreams=None,
         mapping_limit=100_000,
         audit_path: Path | None = None,
+        max_active_requests=32,
+        max_provider_requests=8,
     ):
         if address[0] != "127.0.0.1":
             raise ValueError("Gateway must bind to IPv4 loopback.")
@@ -1286,6 +1442,15 @@ class PrivacyGateway(ThreadingHTTPServer):
         ):
             raise ValueError("Mapping limit must be a positive integer.")
         self.mapping_limit = mapping_limit
+        for limit in (max_active_requests, max_provider_requests):
+            if type(limit) is not int or limit < 1:
+                raise ValueError("Request admission limits must be positive integers.")
+        self.max_active_requests = max_active_requests
+        self.max_provider_requests = max_provider_requests
+        self.admission = Condition(RLock())
+        self.admitted_requests = 0
+        self.provider_admitted: dict[str, int] = {}
+        self.closing = False
         self.token = token
         self.upstreams = dict(UPSTREAMS if upstreams is None else upstreams)
         # Explicit API-key modes are opt-in at construction. They are never
@@ -1310,6 +1475,51 @@ class PrivacyGateway(ThreadingHTTPServer):
         self.audit = AuditStore(audit_path) if audit_path is not None else None
         self.audit_write_errors = 0
         super().__init__(address, GatewayHandler)
+
+    def try_admit(self, agent):
+        """Reserve an inference slot without waiting or reading the body."""
+        with self.admission:
+            if (self.closing or self.admitted_requests >= self.max_active_requests
+                or self.provider_admitted.get(agent, 0) >= self.max_provider_requests):
+                return False
+            self.admitted_requests += 1
+            self.provider_admitted[agent] = self.provider_admitted.get(agent, 0) + 1
+            return True
+
+    def release_admission(self, agent):
+        with self.admission:
+            self.admitted_requests -= 1
+            self.provider_admitted[agent] -= 1
+            self.admission.notify_all()
+
+    def drain_and_shutdown(self):
+        """Keep health available until all admitted inference has finished."""
+        with self.admission:
+            self.closing = True
+            self.admission.wait_for(lambda: self.admitted_requests == 0)
+        self.shutdown()
+
+    def session_diagnostics(self):
+        """Return aggregate limits and lifetimes, never mappings or credentials."""
+        with self.admission:
+            active = self.admitted_requests
+            admitted = dict(self.provider_admitted)
+        providers = {}
+        for agent in sorted(self.upstreams):
+            with self.provider_locks[agent]:
+                session = self.sessions.get(agent)
+                item: dict[str, Any] = {"active_requests": admitted.get(agent, 0),
+                        "mapping_limit": self.mapping_limit, "mapping_count": 0,
+                        "ttl_seconds": None, "expires_at": None, "expired": False}
+                if session is not None:
+                    with session.lock:
+                        item.update(mapping_count=len(session.session.forward_store),
+                                    ttl_seconds=session.session.ttl_seconds,
+                                    expires_at=session.session.last_accessed + session.session.ttl_seconds,
+                                    expired=session.session.is_expired())
+                providers[agent] = item
+        return {"active_requests": active, "max_active_requests": self.max_active_requests,
+                "max_provider_requests": self.max_provider_requests, "providers": providers}
 
     def get_session(self, agent):
         with self.provider_locks[agent]:
@@ -1402,7 +1612,11 @@ class PrivacyGateway(ThreadingHTTPServer):
                     del self.sessions[name]
 
     def server_close(self):
+        with self.admission:
+            self.closing = True
         super().server_close()
+        with self.admission:
+            self.admission.wait_for(lambda: self.admitted_requests == 0)
         for session in self.sessions.values():
             with session.lock:
                 session.session.clear()
@@ -1505,7 +1719,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     exc.code if exc.code in {401, 403, 429} else 502,
                     b'{"error":"Subscription catalog unavailable"}',
                 )
-            except (OSError, ValueError):
+            except (OSError, ValueError, http.client.HTTPException):
                 self.send_body(502, b'{"error":"Subscription catalog unavailable"}')
         else:
             self.send_body(
@@ -1568,8 +1782,12 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if self.path == "/shutdown":
             from threading import Thread
 
-            self.send_body(200, b'{"stopping":true}')
-            Thread(target=self.server.shutdown, daemon=True).start()
+            with self.server.admission:
+                self.server.closing = True
+            try:
+                self.send_body(200, b'{"stopping":true}')
+            finally:
+                Thread(target=self.server.drain_and_shutdown, daemon=True).start()
             return
         if self.path == "/reset":
             try:
@@ -1643,6 +1861,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 if agent in API_AUTH_PREFIXES
                 else b'{"error":"Existing subscription OAuth login required; API keys refused"}',
             )
+            return
+        if not self.server.try_admit(agent):
+            self.response_headers = {"Retry-After": "1"}
+            self.send_body(503 if self.server.closing else 429,
+                           b'{"error":"Gateway inference capacity unavailable; retry later"}')
             return
         meta = self.audit_metadata
         if meta is not None:
@@ -1746,7 +1969,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
                         self.send_body(status, b'{"error":"Upstream transport unavailable"}')
                         return
                     if len(body) > LIMIT:
-                        raise ValueError("Response size limit exceeded.")
+                        self.send_body(502, b'{"error":"Upstream response size limit exceeded"}')
+                        return
                     content_type = upstream.headers.get(
                         "Content-Type", "application/json"
                     )
@@ -1757,7 +1981,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     with session.lock:
                         if meta is not None:
                             meta["outcome"] = "restore_error"
-                        restored = session.response(body, content_type, dialect=dialect)
+                        try:
+                            restored = session.response(body, content_type, dialect=dialect)
+                        except (ValueError, TypeError, AttributeError, KeyError, RecursionError):
+                            self.send_body(502, b'{"error":"Upstream response could not be safely restored"}')
+                            return
                         self.server.save(agent, session)
                 self.send_body(200, restored, content_type)
             finally:
@@ -1781,6 +2009,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 400,
                 b'{"error":"Privacy gateway could not safely process this request; nothing bypassed masking"}',
             )
+        finally:
+            self.server.release_admission(agent)
 
 
 def supported_query(query):

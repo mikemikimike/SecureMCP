@@ -58,12 +58,16 @@ recoverable. Korean allomorph normalization is a separate opt-in operation for g
 
 Every engine allocation uses the generator's reentrant operation lock. Session clear acquires the
 same lock, waits for work and invalidates future operations. The vault lock protects the registry;
-lock order is vault then session. A daemon sweep releases idle expired mappings within the cleanup
-interval. Close stops the worker and clears references. Custom library store mutations require
+cleanup takes session locks without blocking and skips pinned provider requests. A daemon sweep
+releases idle expired mappings within the cleanup interval. LocalPrivacyClient pins the full
+mask/provider/restore span. Close stops the worker and clears references. Custom store mutations require
 `session.operation()`. Clearing references is not physical memory zeroization.
 
 CLI transfer is opt-in authenticated encryption with random salt and a password KDF. Schema v2
 persists mappings and allocation counters without re-running the generator. Legacy v1 is read;
-unknown versions fail explicitly. A CLI transaction holds an exclusive lock file from load to save.
-Concurrent writes fail, atomic replacement prevents partial snapshots, and stale locks require
-operator inspection after a crash. Caller-owned standalone sessions have caller-owned lifetime.
+unknown versions fail explicitly. A CLI transaction holds an exclusive OS advisory lock from
+load to save. Concurrent writes fail and atomic replacement prevents partial snapshots. Native
+locks release on process exit; marked lock files remain and must not be unlinked. Legacy empty
+locks require operator migration. Gateway owners reuse one derived encryption context per
+lifetime; ordinary independent CLI snapshots derive separately. Caller-owned standalone
+sessions have caller-owned lifetime.

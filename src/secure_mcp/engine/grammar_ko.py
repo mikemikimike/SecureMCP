@@ -308,6 +308,9 @@ class KoreanGrammarEngine:
         )
         if num_match:
             val, unit, rest = num_match.groups()
+            if rest and rest not in set(KOREAN_JOSA_LIST) | set(KOREAN_COPULA_LIST):
+                # An arbitrary tail is private content, not a grammatical suffix.
+                return clean, "", TokenType.NUMBER
             return val + (unit or ""), rest or "", TokenType.NUMBER
 
         # Check for plural suffix + josa (e.g., 고객들에게 -> stem: 고객, suffix: 들에게)
